@@ -1,0 +1,29 @@
+services:
+  - type: web
+    name: naba-lucky-media-bot
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /healthz
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_MODE
+        value: webhook
+      - key: MAX_UPLOAD_MIB
+        value: "45"
+      - key: MAX_SOURCE_MIB
+        value: "1024"
+      - key: MAX_PLAYLIST
+        value: "10"
+      - key: MAX_BATCH_LINKS
+        value: "10"
+      - key: USER_COOLDOWN_SECONDS
+        value: "15"
+      - key: AUTO_DELETE_SECONDS
+        value: "600"
+      - key: DOWNLOAD_TIMEOUT_SECONDS
+        value: "480"
+      - key: FFMPEG_TIMEOUT_SECONDS
+        value: "240"
