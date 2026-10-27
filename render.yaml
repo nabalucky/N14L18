@@ -21,6 +21,10 @@ services:
         value: "10"
       - key: MAX_PENDING_QUEUE
         value: "100"
+      - key: DEFAULT_VIDEO_QUALITY
+        value: best
+      - key: QUALITY_PREFERENCES_FILE
+        value: /tmp/dlbot_quality_preferences.json
       - key: YOUTUBE_VERIFICATION_COOLDOWN_SECONDS
         value: "600"
       - key: USER_COOLDOWN_SECONDS

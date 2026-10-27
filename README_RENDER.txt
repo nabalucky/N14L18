@@ -86,12 +86,19 @@ INSTAGRAM COOKIE-FREE LIMITATION
 - This version intentionally never passes Instagram cookies to yt-dlp or curl-cffi. It uses curl-cffi browser impersonation and, after an extractor failure, checks only public HTML metadata for a direct CDN video URL. If Instagram does not expose one to the hosting server (login wall, rate limit, or IP block), a no-cookie downloader cannot guarantee retrieval. Do not add fingerprint rotation or private API scraping to try to defeat those restrictions.
 
 
-Version v12.4 notes
--------------------
+Previous v12.4 notes (retained for reference)
+-------------------------------------------
 * All plain URL messages enter one FIFO queue; later messages are not rejected while a download is active.
 * One worker processes queued links sequentially, default capacity 100 waiting jobs.
 * YouTube's explicit anonymous bot/verification refusal is shown clearly and stops repeated quality attempts. Further YouTube requests pause for 10 minutes by default after the challenge; Instagram jobs continue. The bot does not bypass source identity checks.
-* Use /q or /auto for default quality settings; use /choose URL for a manual YouTube resolution menu.
+* Current quality settings are documented below in the v12.5 section.
 * Pending queued jobs are in memory and are lost if the hosting service restarts.
 
 Environment variable: `YOUTUBE_VERIFICATION_COOLDOWN_SECONDS` (default `600`, maximum `3600`) controls the pause after YouTube explicitly challenges anonymous requests. Set it to `0` to disable the pause.
+
+
+YOUTUBE QUALITY SETTINGS (v12.5)
+--------------------------------
+Use /q or /quality to set the per-user default quality (2160p, 1440p, 1080p, 720p, 480p, 360p, 240p, 144p, or Best available). /auto sets Best available. Use /choose URL for a one-time selection; the per-video menu includes Best available and Use my default. The selected default is captured when a job is queued, so changing settings affects newly queued links.
+
+DEFAULT_VIDEO_QUALITY defaults to 'best' for users without a saved preference. User preferences are saved to QUALITY_PREFERENCES_FILE locally. When DATABASE_URL is configured, the bot also stores preferences in PostgreSQL so they can survive Render restarts/redeploys. Without PostgreSQL, the local file may be lost on Render Free instance replacement.

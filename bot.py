@@ -61,7 +61,7 @@ MAX_PLAYLIST = max(1, min(int(os.environ.get("MAX_PLAYLIST", "10")), 20))
 MAX_BATCH_LINKS = max(1, min(int(os.environ.get("MAX_BATCH_LINKS", "10")), 20))
 MAX_PENDING_QUEUE = max(20, min(int(os.environ.get("MAX_PENDING_QUEUE", "100")), 200))
 YOUTUBE_VERIFICATION_COOLDOWN = max(0, min(int(os.environ.get("YOUTUBE_VERIFICATION_COOLDOWN_SECONDS", "600")), 3600))
-BOT_VERSION = "v12.4-youtube-error-queue-fix"
+BOT_VERSION = "v12.5-quality-controls"
 USER_COOLDOWN = max(0, int(os.environ.get("USER_COOLDOWN_SECONDS", "15")))
 DOWNLOAD_TIMEOUT = max(90, int(os.environ.get("DOWNLOAD_TIMEOUT_SECONDS", "480")))
 FFMPEG_TIMEOUT = max(60, int(os.environ.get("FFMPEG_TIMEOUT_SECONDS", "240")))
@@ -73,6 +73,20 @@ AUTO_DELETE_SECONDS = max(60, int(os.environ.get("AUTO_DELETE_SECONDS", "600")))
 MAX_PARTS = 128
 MAX_SPLIT_DEPTH = 8
 WORK_DIR = os.environ.get("WORK_DIR", "/tmp")
+QUALITY_LEVELS = (2160, 1440, 1080, 720, 480, 360, 240, 144)
+QUALITY_PREFERENCES_FILE = os.environ.get(
+    "QUALITY_PREFERENCES_FILE", os.path.join(WORK_DIR, "dlbot_quality_preferences.json")
+)
+_DEFAULT_VIDEO_QUALITY_RAW = os.environ.get("DEFAULT_VIDEO_QUALITY", "best").strip().lower()
+if _DEFAULT_VIDEO_QUALITY_RAW in {"best", "auto", "automatic", ""}:
+    DEFAULT_VIDEO_QUALITY_VALUE: int | None = None
+else:
+    try:
+        DEFAULT_VIDEO_QUALITY_VALUE = int(_DEFAULT_VIDEO_QUALITY_RAW)
+    except ValueError as exc:
+        raise RuntimeError("DEFAULT_VIDEO_QUALITY must be 'best' or one of: 2160, 1440, 1080, 720, 480, 360, 240, 144") from exc
+    if DEFAULT_VIDEO_QUALITY_VALUE not in QUALITY_LEVELS:
+        raise RuntimeError("DEFAULT_VIDEO_QUALITY must be 'best' or one of: 2160, 1440, 1080, 720, 480, 360, 240, 144")
 # Pending message deletions survive an in-process restart when this state file survives.
 # Render Free storage is ephemeral across instance replacement/redeploy.
 AUTO_DELETE_STATE_FILE = os.environ.get("AUTO_DELETE_STATE_FILE", os.path.join(WORK_DIR, "dlbot_auto_delete.json"))
@@ -139,6 +153,8 @@ log = logging.getLogger("media-bot")
 _STATE_LOCK = threading.RLock()
 _last_job: dict[int, float] = {}
 _user_quality: dict[int, int | None] = {}
+_QUALITY_LOCK = threading.RLock()
+_QUALITY_PREF_UNSET = object()
 _active_users: set[int] = set()
 _PENDING: dict[str, dict[str, Any]] = {}
 _DELETE_TASKS: dict[tuple[int, int], asyncio.Task] = {}
@@ -161,8 +177,9 @@ WELCOME = (
     "/playlist URL — queue a bounded playlist\n"
     "/choose URL — open the per-video quality menu\n"
     f"Send up to {MAX_BATCH_LINKS} links in one message; up to {MAX_PENDING_QUEUE} jobs can wait in the queue.\n"
-    "/q — choose a preferred maximum video quality\n"
-    "/auto — return to automatic quality selection\n"
+    "/q or /quality — set your default YouTube quality\n"
+    "/choose URL — choose a quality for one YouTube video\n"
+    "/auto — use best available quality for future video downloads\n"
     "/stats — view your download statistics\n"
     "/history — show your last five links\n"
     "/again NUMBER — queue a recent link again\n"
@@ -188,6 +205,121 @@ def _write_json_atomic(path: str, payload: Any) -> None:
         stream.flush()
         os.fsync(stream.fileno())
     os.replace(temp_path, path)
+
+
+def _normalize_quality_preference(value: Any) -> int | None:
+    """Return a valid maximum height, or None for best-available/automatic quality."""
+    if value is None or (isinstance(value, str) and value.strip().lower() in {"best", "auto", "automatic", ""}):
+        return None
+    try:
+        height = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Unsupported quality preference.") from exc
+    if height not in QUALITY_LEVELS:
+        raise ValueError("Choose best available or one of: 2160p, 1440p, 1080p, 720p, 480p, 360p, 240p, 144p.")
+    return height
+
+
+def _load_quality_preferences_file() -> None:
+    """Load user quality preferences from local state; invalid values are ignored."""
+    raw = _read_json(QUALITY_PREFERENCES_FILE, {})
+    if not isinstance(raw, dict):
+        return
+    loaded: dict[int, int | None] = {}
+    for user_id, value in raw.items():
+        try:
+            uid = int(user_id)
+            if uid > 0:
+                loaded[uid] = _normalize_quality_preference(value)
+        except (TypeError, ValueError):
+            continue
+    with _QUALITY_LOCK:
+        _user_quality.update(loaded)
+
+
+def _save_quality_preferences_file() -> None:
+    with _QUALITY_LOCK:
+        payload = {str(uid): value for uid, value in _user_quality.items()}
+    _write_json_atomic(QUALITY_PREFERENCES_FILE, payload)
+
+
+def _get_quality_preference(user_id: int) -> int | None:
+    with _QUALITY_LOCK:
+        if int(user_id) in _user_quality:
+            return _user_quality[int(user_id)]
+    return DEFAULT_VIDEO_QUALITY_VALUE
+
+
+def _set_quality_preference_sync(user_id: int, value: Any) -> int | None:
+    """Persist a per-user default locally and to PostgreSQL when configured."""
+    normalized = _normalize_quality_preference(value)
+    with _QUALITY_LOCK:
+        _user_quality[int(user_id)] = normalized
+        payload = {str(uid): pref for uid, pref in _user_quality.items()}
+    try:
+        _write_json_atomic(QUALITY_PREFERENCES_FILE, payload)
+    except OSError as exc:
+        log.warning("Could not persist quality preferences locally (%s)", type(exc).__name__)
+
+    if DATABASE_URL:
+        try:
+            if _init_delete_db():
+                import psycopg
+                with psycopg.connect(DATABASE_URL, connect_timeout=5) as conn:
+                    conn.execute(
+                        "INSERT INTO bot_user_quality_preferences (user_id, max_height, updated_at) "
+                        "VALUES (%s, %s, CURRENT_TIMESTAMP) "
+                        "ON CONFLICT (user_id) DO UPDATE SET max_height = EXCLUDED.max_height, "
+                        "updated_at = CURRENT_TIMESTAMP",
+                        (int(user_id), normalized),
+                    )
+        except Exception as exc:
+            try:
+                _mark_delete_db_unavailable()
+            except Exception:
+                pass
+            log.warning("Could not persist quality preference to PostgreSQL (%s)", type(exc).__name__)
+    return normalized
+
+
+def _load_quality_preferences_from_db() -> int:
+    """Overlay durable preferences from PostgreSQL on local fallback state."""
+    if not DATABASE_URL or not _init_delete_db():
+        return 0
+    try:
+        import psycopg
+        with psycopg.connect(DATABASE_URL, connect_timeout=5) as conn:
+            rows = conn.execute(
+                "SELECT user_id, max_height FROM bot_user_quality_preferences"
+            ).fetchall()
+        count = 0
+        with _QUALITY_LOCK:
+            for user_id, value in rows:
+                try:
+                    _user_quality[int(user_id)] = _normalize_quality_preference(value)
+                    count += 1
+                except (TypeError, ValueError):
+                    continue
+            payload = {str(uid): pref for uid, pref in _user_quality.items()}
+        try:
+            _write_json_atomic(QUALITY_PREFERENCES_FILE, payload)
+        except OSError as exc:
+            log.warning("Could not refresh local quality preferences (%s)", type(exc).__name__)
+        return count
+    except Exception as exc:
+        try:
+            _mark_delete_db_unavailable()
+        except Exception:
+            pass
+        log.warning("Could not load quality preferences from PostgreSQL (%s)", type(exc).__name__)
+        return 0
+
+
+def _quality_preference_label(value: int | None) -> str:
+    return f"Up to {value}p" if value is not None else "Best available (automatic)"
+
+
+_load_quality_preferences_file()
 
 
 def load_stats() -> dict[str, Any]:
@@ -1064,7 +1196,7 @@ def _get_video_meta(url: str) -> dict[str, Any] | None:
             for fmt in info.get("formats", []):
                 height = fmt.get("height")
                 vcodec = fmt.get("vcodec")
-                if not height or height > 1080 or not vcodec or vcodec == "none":
+                if not height or height < 144 or height > 2160 or not vcodec or vcodec == "none":
                     continue
                 size = int(fmt.get("filesize") or fmt.get("filesize_approx") or 0)
                 current = vids.get(int(height))
@@ -1088,7 +1220,7 @@ def _quality_selector(height: int) -> str:
     The requested height is a ceiling: if 1080p is only available as VP9/AV1,
     prefer an available lower-resolution AVC stream over forcing a slow transcode.
     """
-    h = max(144, min(int(height), 1080))
+    h = max(144, min(int(height), 2160))
     return (
         f"bv*[height={h}][ext=mp4][vcodec^=avc1]+ba[ext=m4a][acodec^=mp4a]/"
         f"b[height={h}][ext=mp4][vcodec^=avc1]/"
@@ -1099,19 +1231,35 @@ def _quality_selector(height: int) -> str:
         f"bv*[height<={h}]+ba/b[height<={h}]"
     )
 
-def _format_chain(user_id: int, force_fmt: str | None = None) -> list[str]:
+def _format_chain(
+    user_id: int,
+    force_fmt: str | None = None,
+    preferred_override: int | None | object = _QUALITY_PREF_UNSET,
+) -> list[str]:
+    """Build explicit format fallbacks for a one-time choice or saved user default.
+
+    None means best available with no resolution ceiling. An integer means a maximum
+    resolution; lower choices are only attempted if the chosen format cannot be used.
+    """
     if force_fmt:
+        if force_fmt == "best":
+            return ["best", *(_quality_selector(h) for h in (2160, 1440, 1080, 720, 480, 360, 240, 144))]
         match = re.search(r"height[<]?=?([0-9]+)", force_fmt)
         max_height = int(match.group(1)) if match else 1080
-        heights = [h for h in [1080, 720, 480, 360] if h < max_height]
-        # Honour the selected menu item first; only step down if its download or
-        # preparation fails. Never retry the same top resolution several times.
+        heights = [h for h in QUALITY_LEVELS if h < max_height]
         return list(dict.fromkeys([force_fmt] + [_quality_selector(h) for h in heights]))
-    preferred = _user_quality.get(user_id)
-    max_height = preferred or 1080
-    heights = [h for h in [1080, 720, 480, 360] if h <= max_height]
+
+    preferred = _get_quality_preference(user_id) if preferred_override is _QUALITY_PREF_UNSET else preferred_override
+    if preferred is None:
+        # yt-dlp's normal best selection is the true best available format. Later
+        # selectors provide resolution fallbacks if extraction/preparation fails.
+        return ["best", *(_quality_selector(h) for h in QUALITY_LEVELS)]
+    max_height = _normalize_quality_preference(preferred)
+    if max_height is None:
+        return ["best", *(_quality_selector(h) for h in QUALITY_LEVELS)]
+    heights = [h for h in QUALITY_LEVELS if h <= max_height]
     selectors = [_quality_selector(h) for h in heights]
-    selectors.append(f"best[height<={max_height}]" if max_height else "best")
+    selectors.append(f"best[height<={max_height}]")
     return list(dict.fromkeys(selectors))
 
 # --------------------------- FFprobe / splitting ---------------------------
@@ -1620,6 +1768,11 @@ def _init_delete_db() -> bool:
                     "due_at DOUBLE PRECISION NOT NULL, "
                     "PRIMARY KEY (chat_id, message_id))"
                 )
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS bot_user_quality_preferences ("
+                    "user_id BIGINT PRIMARY KEY, max_height INTEGER NULL, "
+                    "updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+                )
             _DELETE_DB_READY = True
             _DELETE_DB_NEXT_RETRY = 0.0
             log.info("Auto-delete persistent database enabled")
@@ -2114,6 +2267,7 @@ async def _run_pipeline(
     force_fmt: str | None = None,
     status=None,
     enforce_cooldown: bool = False,
+    quality_pref: int | None | object = _QUALITY_PREF_UNSET,
 ) -> bool:
     user = update.effective_user
     message = update.effective_message
@@ -2187,7 +2341,7 @@ async def _run_pipeline(
 
             chain = (
                 ["best[ext=mp4]/best"] if _is_instagram_url(url) and not subtitles
-                else (["best[ext=mp4]/best"] if mp3 else _format_chain(uid, force_fmt))
+                else (["best[ext=mp4]/best"] if mp3 else _format_chain(uid, force_fmt, quality_pref))
             )
             last_error = "No compatible format was found."
             for index, fmt in enumerate(chain, start=1):
@@ -2456,7 +2610,7 @@ async def _enqueue_download_requests(
             "key": key, "url": url, "update": update, "context": context,
             "user_id": user.id, "chat_id": message.chat_id,
             "mp3": mp3, "subtitles": subtitles, "force_fmt": force_fmt,
-            "playlist": playlist,
+            "playlist": playlist, "quality_pref": _get_quality_preference(user.id),
         }))
 
     # The lock plus queue.put_nowait keeps enqueue operations atomic and in handler order.
@@ -2534,6 +2688,7 @@ async def _execute_queued_item(app: Application, item: dict[str, Any]) -> None:
                 update, context, link,
                 mp3=bool(item.get("mp3")), subtitles=bool(item.get("subtitles")),
                 force_fmt=item.get("force_fmt"), status=status,
+                quality_pref=item.get("quality_pref", _QUALITY_PREF_UNSET),
             )
             successes += int(ok)
             if index < len(links):
@@ -2545,6 +2700,7 @@ async def _execute_queued_item(app: Application, item: dict[str, Any]) -> None:
     await _run_pipeline(
         update, context, url, mp3=bool(item.get("mp3")), subtitles=bool(item.get("subtitles")),
         force_fmt=item.get("force_fmt"), status=status,
+        quality_pref=item.get("quality_pref", _QUALITY_PREF_UNSET),
     )
 
 
@@ -2675,7 +2831,11 @@ async def youtube_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, url: 
         label_size = f" — {size / 1048576:.1f} MiB" if size else ""
         selector = _quality_selector(height)
         options.append((f"🎬 {height}p{label_size}", selector))
-    options += [("🎵 Download MP3", "__MP3__"), ("⚡ Automatic quality", "__AUTO__")]
+    options += [
+        ("⚡ Best available", "__AUTO__"),
+        ("⚙️ Use my default", "__DEFAULT__"),
+        ("🎵 Download MP3", "__MP3__"),
+    ]
     if not options:
         try:
             await status.delete()
@@ -2698,8 +2858,10 @@ async def youtube_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, url: 
                 callback_data = f"ym:{video_id}:{owner}"
             elif fmt == "__AUTO__":
                 callback_data = f"ya:{video_id}:{owner}"
+            elif fmt == "__DEFAULT__":
+                callback_data = f"yd:{video_id}:{owner}"
             else:
-                height_match = re.search(r"(1080|720|480|360|240|144)", label)
+                height_match = re.search(r"(\d{3,4})p", label)
                 height = int(height_match.group(1)) if height_match else 1080
                 callback_data = f"yq:{video_id}:{height}:{owner}"
         else:
@@ -2716,7 +2878,7 @@ async def youtube_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, url: 
     caption = f"<b>{title}</b>"
     if duration:
         caption += f"\nDuration: {duration // 60}:{duration % 60:02d}"
-    caption += "\nQuality buttons select a maximum resolution; compatible H.264 streams are preferred for faster playback."
+    caption += "\nChoose a one-time resolution, Best available, or Use my default. /q changes your default for future links."
     try:
         await status.delete()
         cancel_auto_delete(status)
@@ -2767,13 +2929,13 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     query = update.callback_query
     data = query.data or ""
     # Avoid sending a fresh chat message for each repeated tap while a download is active.
-    if (data.startswith(("yq:", "ya:", "ym:", "pick_"))
+    if (data.startswith(("yq:", "ya:", "yd:", "ym:", "pick_"))
             and query.from_user.id in _active_users):
         await query.answer("A download is already running. Please wait for it to finish.", show_alert=True)
         return
     await query.answer()
     # Self-contained YouTube callbacks remain valid if Render restarts and loses RAM state.
-    if data.startswith(("yq:", "ya:", "ym:")):
+    if data.startswith(("yq:", "ya:", "yd:", "ym:")):
         try:
             fields = data.split(":")
             action = fields[0]
@@ -2784,7 +2946,7 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 if len(fields) != 4:
                     raise ValueError("invalid quality callback")
                 height, owner = int(fields[2]), int(fields[3])
-                if height not in {1080, 720, 480, 360, 240, 144}:
+                if height < 144 or height > 2160 or height % 2:
                     raise ValueError("unsupported quality")
             else:
                 if len(fields) != 3:
@@ -2798,8 +2960,12 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             if action == "ym":
                 await download_job(update, context, source_url, mp3=True)
             elif action == "ya":
-                _user_quality[query.from_user.id] = None
-                await download_job(update, context, source_url)
+                # One-time best choice; do not silently change the user's saved default.
+                await download_job(update, context, source_url, force_fmt="best")
+            elif action == "yd":
+                preferred = _get_quality_preference(query.from_user.id)
+                selector = _quality_selector(preferred) if preferred is not None else "best"
+                await download_job(update, context, source_url, force_fmt=selector)
             elif action == "yq":
                 await download_job(update, context, source_url, force_fmt=_quality_selector(height))
             return
@@ -2807,7 +2973,7 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             await reply_text_auto(context, query.message, "This menu button is invalid. Send the video link again.")
             return
     if data == "quality_menu":
-        await send_quality_menu(query.message, context)
+        await send_quality_menu(query.message, context, query.from_user.id)
         return
     if data == "help_mp3":
         await reply_text_auto(context, query.message, "To download audio, send: /audio https://example.com/video")
@@ -2816,10 +2982,17 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await reply_text_auto(context, query.message, "Use /stats to view your download statistics.")
         return
     if data.startswith("setq_"):
-        value = data.split("_", 1)[1]
-        _user_quality[query.from_user.id] = None if value == "auto" else int(value)
-        await reply_text_auto(context, query.message, "Quality preference set to automatic." if value == "auto"
-                                       else f"Quality preference set to {value}p.")
+        value = data.split("_", 1)[1].strip().lower()
+        try:
+            normalized = _normalize_quality_preference(value)
+        except ValueError:
+            await reply_text_auto(context, query.message, "That quality option is invalid. Open /q and choose an available option.")
+            return
+        await asyncio.to_thread(_set_quality_preference_sync, query.from_user.id, normalized)
+        await reply_text_auto(
+            context, query.message,
+            f"Default YouTube quality saved: {_quality_preference_label(normalized)}. Future links will use this setting."
+        )
         return
     if not data.startswith("pick_"):
         return
@@ -2845,34 +3018,50 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if fmt == "__MP3__":
         await download_job(update, context, entry["url"], mp3=True)
     elif fmt == "__AUTO__":
-        _user_quality[query.from_user.id] = None
-        await download_job(update, context, entry["url"])
+        await download_job(update, context, entry["url"], force_fmt="best")
+    elif fmt == "__DEFAULT__":
+        preferred = _get_quality_preference(query.from_user.id)
+        await download_job(update, context, entry["url"],
+                           force_fmt=_quality_selector(preferred) if preferred is not None else "best")
     else:
         await download_job(update, context, entry["url"], force_fmt=fmt)
 
 
-async def send_quality_menu(message, context: ContextTypes.DEFAULT_TYPE) -> None:
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("1080p", callback_data="setq_1080"),
-         InlineKeyboardButton("720p", callback_data="setq_720")],
-        [InlineKeyboardButton("480p", callback_data="setq_480"),
-         InlineKeyboardButton("360p", callback_data="setq_360")],
-        [InlineKeyboardButton("Automatic", callback_data="setq_auto")],
-    ])
-    await reply_text_auto(context, message, "Choose your preferred maximum video quality:", reply_markup=keyboard)
+async def send_quality_menu(message, context: ContextTypes.DEFAULT_TYPE, user_id: int | None = None) -> None:
+    uid = int(user_id) if user_id is not None else None
+    current = _quality_preference_label(_get_quality_preference(uid)) if uid is not None else _quality_preference_label(DEFAULT_VIDEO_QUALITY_VALUE)
+    rows = [
+        [InlineKeyboardButton("2160p", callback_data="setq_2160"), InlineKeyboardButton("1440p", callback_data="setq_1440")],
+        [InlineKeyboardButton("1080p", callback_data="setq_1080"), InlineKeyboardButton("720p", callback_data="setq_720")],
+        [InlineKeyboardButton("480p", callback_data="setq_480"), InlineKeyboardButton("360p", callback_data="setq_360")],
+        [InlineKeyboardButton("240p", callback_data="setq_240"), InlineKeyboardButton("144p", callback_data="setq_144")],
+        [InlineKeyboardButton("⚡ Best available", callback_data="setq_best")],
+    ]
+    keyboard = InlineKeyboardMarkup(rows)
+    text = (
+        f"Your default YouTube quality: {current}\n\n"
+        "Choose a maximum resolution for future video and Shorts links. This is your saved default; "
+        "videos may download at a lower resolution when the source has no matching format.\n\n"
+        "⚡ Best available removes the resolution cap and lets yt-dlp choose the best format exposed by the source.\n"
+        "For a one-time choice, use /choose followed by a YouTube URL."
+    )
+    await reply_text_auto(context, message, text, reply_markup=keyboard)
 
 
 async def handle_quality(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_message:
         schedule_auto_delete(context, update.effective_message)
-    await send_quality_menu(update.effective_message, context)
+    await send_quality_menu(update.effective_message, context, update.effective_user.id if update.effective_user else None)
 
 
 async def handle_auto(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_message:
         schedule_auto_delete(context, update.effective_message)
-    _user_quality[update.effective_user.id] = None
-    await reply_text_auto(context, update.effective_message, "Automatic quality selection is enabled.")
+    uid = update.effective_user.id if update.effective_user else 0
+    if not uid:
+        return
+    await asyncio.to_thread(_set_quality_preference_sync, uid, None)
+    await reply_text_auto(context, update.effective_message, "Default quality set to Best available. Future videos use the best format exposed by the source.")
 
 
 async def handle_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3057,6 +3246,10 @@ async def _telegram_heartbeat(app: Application) -> None:
 async def post_init(app: Application) -> None:
     global BOT_READY, LAST_TELEGRAM_OK
     _recover_pending_auto_deletes(app)
+    if DATABASE_URL:
+        loaded_preferences = await asyncio.to_thread(_load_quality_preferences_from_db)
+        if loaded_preferences:
+            log.info("Loaded %s saved quality preference(s) from PostgreSQL", loaded_preferences)
     if not DATABASE_URL:
         log.warning(
             "DATABASE_URL is not configured: auto-delete can recover only while the local state file survives; "
@@ -3064,9 +3257,10 @@ async def post_init(app: Application) -> None:
         )
     await app.bot.set_my_commands([
         BotCommand("start", "Show help and commands"),
-        BotCommand("q", "Choose preferred video quality"),
-        BotCommand("choose", "Open a per-video quality menu"),
-        BotCommand("auto", "Enable automatic quality selection"),
+        BotCommand("q", "Set default YouTube quality"),
+        BotCommand("quality", "Set default YouTube quality"),
+        BotCommand("choose", "Choose quality for one video"),
+        BotCommand("auto", "Set Best available as default"),
         BotCommand("audio", "Download audio as MP3"),
         BotCommand("sub", "Download available subtitles"),
         BotCommand("playlist", "Download a playlist (limited items)"),
@@ -3114,7 +3308,10 @@ async def _retry_auto_delete_database(app: Application) -> None:
         if ready and not previously_ready:
             # Reload rows that may have been missed while the database was unavailable.
             _recover_pending_auto_deletes(app)
-            log.info("Auto-delete recovery completed after database reconnect")
+            loaded_preferences = await asyncio.to_thread(_load_quality_preferences_from_db)
+            if loaded_preferences:
+                log.info("Loaded %s saved quality preference(s) after PostgreSQL reconnect", loaded_preferences)
+            log.info("Auto-delete/quality preference recovery completed after database reconnect")
         previously_ready = ready
 
 
@@ -3155,6 +3352,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("stats", handle_stats))
     app.add_handler(CommandHandler("auto", handle_auto))
     app.add_handler(CommandHandler("q", handle_quality))
+    app.add_handler(CommandHandler("quality", handle_quality))
     app.add_handler(CommandHandler("choose", handle_choose_quality))
     app.add_handler(CommandHandler("history", handle_history))
     app.add_handler(CommandHandler("again", handle_again))
@@ -3187,6 +3385,8 @@ def check_runtime() -> None:
     deno = shutil.which("deno")
     log.info("Deno runtime: %s", deno or "not detected (some YouTube downloads may fail)")
     log.info("Pending queue capacity: %s", MAX_PENDING_QUEUE)
+    log.info("Default YouTube quality for new users: %s", _quality_preference_label(DEFAULT_VIDEO_QUALITY_VALUE))
+    log.info("User quality preferences file: %s", QUALITY_PREFERENCES_FILE)
     log.info("YouTube verification failures stop format retries early")
 
 

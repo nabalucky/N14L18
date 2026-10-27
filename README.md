@@ -38,7 +38,7 @@ N14L18 is a Telegram bot for downloading supported public media links through an
 - Playlists are expanded within the configured limit and their items are downloaded sequentially. Pending in-memory jobs are lost if the service restarts; resend those links after restart.
 - When YouTube responds with “Sign in to confirm you're not a bot”, the bot shows a clear source-access error, stops wasteful format retries, and pauses additional YouTube jobs for 10 minutes by default. Instagram jobs continue. This is a YouTube verification/rate-limit response, not a quality-selection bug; code cannot guarantee anonymous access when YouTube withholds the stream.
 - YouTube cookies remain optional and are passed only to YouTube URLs if configured in the hosting environment. Never put credentials or cookies in source code, chats, or GitHub.
-- Use `/q` or `/auto` to set your preferred quality behavior. Use `/choose URL` to open the per-video resolution menu. Normal sent links auto-download using the selected preference.
+- Use `/q` or `/quality` to set your saved default YouTube resolution; `/auto` selects Best available. Use `/choose URL` for a one-time per-video resolution menu with Best available and Use my default options. Quality preferences are stored locally and, when `DATABASE_URL` is configured, also in PostgreSQL so they can survive a restart/redeploy.
 
 ## Supported Sources
 
@@ -100,7 +100,7 @@ Do not put real tokens, cookies, database passwords, or other credentials in sou
 
 1. Open your bot in Telegram and send `/start`.
 2. Send a supported public media URL to see the available download workflow.
-3. Select a video quality, automatic quality, or audio option when offered.
+3. Send `/q` or `/quality` to set the default YouTube resolution, or `/choose URL` to select a quality for one video. Use Best available for the source maximum.
 4. For multiple links, send several URLs in one message. They are processed sequentially up to the configured batch limit.
 5. For a playlist, use `/playlist <URL>`.
 6. Downloaded media remains in chat. Temporary bot messages are scheduled for cleanup after the configured period.
@@ -110,8 +110,8 @@ Do not put real tokens, cookies, database passwords, or other credentials in sou
 | Command | Purpose |
 | --- | --- |
 | `/start` | Open the bot's welcome/help menu. |
-| `/q` | Open the video quality menu. |
-| `/auto` | Enable automatic quality selection. |
+| `/q`, `/quality` | Set the default maximum YouTube resolution (2160p through 144p) or Best available. |
+| `/auto` | Set Best available as your default; no fixed resolution ceiling. |
 | `/audio <URL>` | Download audio as MP3 when supported. |
 | `/sub <URL>` | Request subtitles when the source provides them. |
 | `/playlist <URL>` | Process a supported playlist sequentially, within the configured limit. |
@@ -134,7 +134,9 @@ Set configuration in your hosting dashboard or local environment. Do not hard-co
 | `WEBHOOK_URL` | `RENDER_EXTERNAL_URL` when available | Optional HTTPS base URL for webhook deployment; do not append the webhook path. |
 | `TELEGRAM_WEBHOOK_PATH` | `telegram` | HTTP route suffix used by the webhook. |
 | `TELEGRAM_WEBHOOK_SECRET` | Derived from the bot token if omitted | Optional separate webhook secret; use letters, digits, `_` or `-`, up to 256 characters. |
-| `DATABASE_URL` | Optional | PostgreSQL connection string for restart-resilient pending-message deletion records. Recommended for hosted deployments. |
+| `DATABASE_URL` | Optional | PostgreSQL connection string for restart-resilient pending-message deletion records and saved per-user quality preferences. Recommended for hosted deployments. |
+| `DEFAULT_VIDEO_QUALITY` | `best` | Default quality for users who have not selected a preference: `best`, `2160`, `1440`, `1080`, `720`, `480`, `360`, `240`, or `144`. User-selected defaults override this value. |
+| `QUALITY_PREFERENCES_FILE` | `/tmp/dlbot_quality_preferences.json` | Local fallback for per-user quality settings when PostgreSQL is not configured. Ephemeral hosting storage may be cleared on restart/redeploy. |
 | `AUTO_DELETE_SECONDS` | `600` | Lifetime for eligible temporary messages; default is 10 minutes. |
 | `MAX_UPLOAD_MIB` | `45` | Target maximum size for each Telegram upload part. |
 | `MAX_SOURCE_MIB` | `1024` | Maximum accepted source size in MiB. |
