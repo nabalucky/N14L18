@@ -1,6 +1,6 @@
-NabaLucky Media Bot — Render deployment bundle (v12.1 reviewed)
+N14L18 Media Bot — Render deployment bundle (v12.3 cookie-free Instagram fallback)
 
-V12.1 REVIEW / FIXES
+V12.3 REVIEW / FIXES
 - Auto-delete timer tasks are no longer registered as PTB-managed background tasks, which could make graceful shutdown wait on long sleeping timers. The bot now cancels its timer tasks explicitly during shutdown and preserves pending due times for restart recovery.
 - Temporary status messages are scheduled as soon as they are created; final status messages reset their 10-minute expiry after the job finishes. This prevents a long-running job from leaving an untracked status message if the process restarts mid-download.
 - Auto-delete state is saved locally and, when DATABASE_URL is configured, in PostgreSQL. Transient database failures are retried; pending rows are reloaded after reconnection. Local state alone is not durable on Render Free.
@@ -11,20 +11,20 @@ V12.1 REVIEW / FIXES
 
 FEATURES
 - YouTube quality menu, automatic quality, MP3 audio, thumbnail preview, playback-friendly MP4 preparation, progress, statistics and history.
-- Best-effort public Instagram reel/video/carousel downloads with image fallback. Instagram may still block anonymous requests.
+- Best-effort public Instagram reel/video/carousel downloads with image fallback. The code uses yt-dlp browser impersonation plus a public-HTML metadata fallback; neither uses Instagram cookies or bypasses login walls. Instagram may still block anonymous requests or the hosting IP.
 - Sequential queue for up to 10 links per message, capped playlist expansion, and split large media into Telegram-uploadable parts.
 - Media title in filename and Telegram caption; split parts include a part number. Supported source metadata is copied/embedded where the container permits it.
 - Temporary link, status, error and menu messages are scheduled for deletion. Progress/status edits renew the TTL while the job is active; when a job finishes, the final status expires after 10 minutes. Media files deliberately remain in chat.
 
 FILES
-- bot.py: latest v12.1 reviewed bot source
+- bot.py: v12.3 cookie-free Instagram public metadata fallback
 - requirements.txt: pinned python-telegram-bot and yt-dlp release, curl-cffi, gallery-dl and PostgreSQL client
 - Dockerfile: Python 3.12, FFmpeg, Deno and Python dependency installation
 - render.yaml: Docker Blueprint settings with webhook mode and safe size/queue defaults
 - README_RENDER.txt: deployment notes and environment variables
 
 IMPORTANT: WHAT THE UPLOADED LOGS SHOWED
-- The latest provided log still says "Bot version: v10-sequential-queue". That means the v11/v12 source changes are not running in the service shown by that log yet.
+- The previously provided log still said "Bot version: v10-sequential-queue". That means the v11/v12 source changes are not running in the service shown by that log yet.
 - Another log reports a Telegram polling conflict. Exactly one live service/process may consume updates for this bot token. Before switching to webhook mode, stop any duplicate polling service/process using the same token, or the old poller can keep producing 409 conflicts.
 - The uploaded Render build command included an unrecognized remote `curl ... | sh` installer from `folkapp.link`. The included Dockerfile installs Deno from its official GitHub release and does not need that custom shell installer. Remove the custom build command and deploy using the provided Docker runtime/Blueprint. Do not run an unknown script piped directly to a shell.
 - If the bot token was ever exposed in logs or public code, revoke it with BotFather and update BOT_TOKEN in Render before testing.
@@ -36,7 +36,7 @@ DEPLOYMENT
 4. Stop every duplicate service/process using this token first. Then set TELEGRAM_MODE=webhook. On Render, RENDER_EXTERNAL_URL is used automatically; if your provider does not set that variable, set WEBHOOK_URL to the HTTPS base URL such as `https://your-service.onrender.com` (do not include `/telegram`).
 5. TELEGRAM_WEBHOOK_SECRET is optional. If not provided, the bot derives a valid secret header token from BOT_TOKEN. For better secret separation, set an independent random secret containing only letters, digits, underscores or hyphens (maximum 256 characters).
 6. For deletion recovery across Render restarts/redeploys, create a Render Postgres database and add its connection string as DATABASE_URL. Without it the bot logs a warning and uses local state only. Render Free local files are ephemeral; the Free Postgres tier currently expires after 30 days, so it is not permanent storage.
-7. Deploy and check logs for `Bot version: v12.1-reviewed-auto-delete`, `Telegram transport mode: webhook`, `Telegram webhook registered`, and `Auto-delete scheduled ...`. Test a short public YouTube video first, then an Instagram post that opens without signing in.
+7. Deploy and check logs for `Bot version: v12.3-cookiefree-instagram-fallback`, `Telegram transport mode: webhook`, `Telegram webhook registered`, and `Auto-delete scheduled ...`. Test a short public YouTube video first, then an Instagram Reel that opens without signing in. Instagram may still withhold media from data-center/server IPs; this version does not use Instagram cookies and cannot override such restrictions.
 8. Uploaded videos/audio/photos/documents are not auto-deleted. Only temporary bot text/menu/status messages and the source-link/command messages are scheduled; Telegram may reject deletion if permissions or message-age restrictions prevent it.
 
 ENVIRONMENT VARIABLES
@@ -74,8 +74,13 @@ KNOWN LIMITATIONS
 - Full VP9/AV1-to-H.264 conversion may be CPU-intensive; conversion has a bounded timeout and the bot can fall back to a playable-as-document original format rather than always re-encoding.
 - Downloader sites can change after release. Live Telegram, YouTube and Instagram end-to-end behavior must still be verified after deployment.
 
-V12.1 OFFLINE QA
+V12.3 OFFLINE QA
 - Python syntax compilation passed.
+- Public HTML fallback only permits direct HTTPS media URLs hosted on cdninstagram.com or fbcdn.net, enforces the source-size cap, and never reads Instagram cookies.
+- Docker build checks that yt-dlp has a Chrome impersonation target.
 - ZIP integrity is checked after packaging.
 - Mock/offline checks passed for URL extraction and validation, YouTube ID extraction, filename title sanitization, bounded playlist expansion (including bare video-ID fallback, deduplication and rejection of local targets), timer reset, persisted timer recovery after shutdown, and webhook secret/path validation plus update-queue delivery.
 - These mocked tests do not verify Telegram's live API, an actual YouTube/Instagram download, Render's runtime configuration, or a live PostgreSQL service. The environment used for this review could not install dependencies over the network, so no live integration run was possible.
+
+INSTAGRAM COOKIE-FREE LIMITATION
+- This version intentionally never passes Instagram cookies to yt-dlp or curl-cffi. It uses curl-cffi browser impersonation and, after an extractor failure, checks only public HTML metadata for a direct CDN video URL. If Instagram does not expose one to the hosting server (login wall, rate limit, or IP block), a no-cookie downloader cannot guarantee retrieval. Do not add fingerprint rotation or private API scraping to try to defeat those restrictions.

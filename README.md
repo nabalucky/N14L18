@@ -34,7 +34,7 @@ N14L18 is a Telegram bot for downloading supported public media links through an
 ## Supported Sources
 
 - **YouTube** — video quality choices, automatic quality, audio extraction, and bounded playlist processing where supported.
-- **Instagram** — best-effort downloads of publicly accessible reels, videos, and carousel media. Instagram may limit or block anonymous requests, including requests from hosting-provider IP addresses.
+- **Instagram** — best-effort downloads of publicly accessible reels, videos, and carousel media. The extractor uses browser impersonation and a fallback that reads only direct video URLs exposed in public HTML metadata. No Instagram cookies are used. Instagram may still limit or block anonymous requests, including requests from hosting-provider IP addresses.
 - **Other public URLs supported by yt-dlp** — may work, but support is not guaranteed or individually verified.
 
 Private, deleted, region-restricted, login-required, DRM-protected, or unsupported media may fail. Source platforms can change without notice.
@@ -173,7 +173,7 @@ The service also reads `VIDEO_TRANSCODE_TIMEOUT_SECONDS`, `VIDEO_TRANSCODE_MAX_H
 - Review the logs for extractor, FFmpeg, timeout, or source-access errors.
 
 **Instagram media is unavailable**
-- Public Instagram extraction is best-effort. Rate limits, login requirements, content type, and hosting IP restrictions can prevent downloads.
+- Public Instagram extraction is best-effort. The bot tries the current yt-dlp extractor with Chrome impersonation and then checks public HTML metadata for a direct CDN video URL. It never uses Instagram cookies. Rate limits, login requirements, missing public media URLs, and hosting IP restrictions can still prevent downloads.
 - Private media and login-wall bypass are not supported.
 
 **Temporary messages remain in chat**

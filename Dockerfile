@@ -24,6 +24,7 @@ WORKDIR /app
 COPY requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt \
     && yt-dlp --version \
+    && yt-dlp --list-impersonate-targets | grep -qi chrome \
     && gallery-dl --version \
     && ffmpeg -version | head -n 1
 COPY bot.py ./bot.py

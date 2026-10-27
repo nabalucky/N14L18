@@ -27,6 +27,7 @@ import uuid
 from collections import deque
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 from concurrent.futures import ThreadPoolExecutor
@@ -58,7 +59,7 @@ MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_MIB", "45")) * 1024 * 1024
 MAX_SOURCE_BYTES = int(os.environ.get("MAX_SOURCE_MIB", "1024")) * 1024 * 1024
 MAX_PLAYLIST = max(1, min(int(os.environ.get("MAX_PLAYLIST", "10")), 20))
 MAX_BATCH_LINKS = max(1, min(int(os.environ.get("MAX_BATCH_LINKS", "10")), 20))
-BOT_VERSION = "v12.1-reviewed-auto-delete"
+BOT_VERSION = "v12.3-cookiefree-instagram-fallback"
 USER_COOLDOWN = max(0, int(os.environ.get("USER_COOLDOWN_SECONDS", "15")))
 DOWNLOAD_TIMEOUT = max(90, int(os.environ.get("DOWNLOAD_TIMEOUT_SECONDS", "480")))
 FFMPEG_TIMEOUT = max(60, int(os.environ.get("FFMPEG_TIMEOUT_SECONDS", "240")))
@@ -450,6 +451,188 @@ def _instagram_url_candidates(url: str) -> list[str]:
     return list(dict.fromkeys(candidates))
 
 
+class _InstagramPublicPageParser(HTMLParser):
+    """Collect video URLs and titles explicitly exposed in public HTML metadata."""
+    _VIDEO_KEYS = {"og:video", "og:video:url", "og:video:secure_url", "twitter:player:stream"}
+    _TITLE_KEYS = {"og:title", "twitter:title"}
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.video_urls: list[str] = []
+        self.titles: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        values = {str(k).lower(): (v or "") for k, v in attrs if k}
+        if tag.lower() == "meta":
+            key = (values.get("property") or values.get("name") or "").lower()
+            content = values.get("content", "").strip()
+            if content and key in self._VIDEO_KEYS:
+                self.video_urls.append(content)
+            elif content and key in self._TITLE_KEYS:
+                self.titles.append(content)
+        # Some public pages expose an actual media source element. Only accept it
+        # if it points to an allowed CDN below; blob: and relative URLs are ignored.
+        elif tag.lower() in {"video", "source"}:
+            src = values.get("src", "").strip()
+            media_type = values.get("type", "").lower()
+            if src and (tag.lower() == "video" or media_type.startswith("video/")):
+                self.video_urls.append(src)
+
+
+def _instagram_allowed_media_host(url: str) -> bool:
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if parsed.scheme.lower() != "https" or parsed.username or parsed.password:
+        return False
+    return (
+        host == "cdninstagram.com" or host.endswith(".cdninstagram.com")
+        or host == "fbcdn.net" or host.endswith(".fbcdn.net")
+    )
+
+
+def _download_instagram_public_video_fallback(
+    url: str, workdir: str, progress: dict[str, Any] | None = None,
+) -> tuple[str | None, str]:
+    """Try direct video URLs explicitly exposed by a public Instagram HTML page.
+
+    No cookies, private APIs, login-wall workarounds, or third-party mirror sites are
+    used. This fallback only succeeds if the public page exposes a direct media URL.
+    """
+    if not _is_instagram_url(url):
+        return None, "Not an Instagram URL"
+    try:
+        from curl_cffi import requests as curl_requests
+    except ImportError:
+        return None, "curl-cffi is not installed; public-page fallback is unavailable"
+
+    if progress is not None:
+        progress.update(stage="Checking public Instagram page", pct="", spd="", done=0, total=0)
+    errors: list[str] = []
+    candidates = _instagram_url_candidates(url)
+    os.makedirs(workdir, exist_ok=True)
+
+    try:
+        with curl_requests.Session(impersonate="chrome") as session:
+            session.headers.update({
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.8",
+                "Upgrade-Insecure-Requests": "1",
+            })
+            for page_url in candidates[:2]:
+                try:
+                    page_response = session.get(page_url, timeout=18, allow_redirects=False)
+                    try:
+                        if int(getattr(page_response, "status_code", 0)) != 200:
+                            errors.append(f"public page HTTP {getattr(page_response, 'status_code', 'unknown')}")
+                            continue
+                        page_html = str(getattr(page_response, "text", "") or "")[:8 * 1024 * 1024]
+                    finally:
+                        close = getattr(page_response, "close", None)
+                        if callable(close):
+                            close()
+                except Exception as exc:
+                    errors.append(f"public page request failed ({type(exc).__name__})")
+                    continue
+
+                parser = _InstagramPublicPageParser()
+                try:
+                    parser.feed(page_html)
+                except Exception:
+                    pass
+                media_urls = list(parser.video_urls)
+                # A small fallback for URL values embedded in public JSON/HTML. This
+                # does not call internal APIs; it only reads the public page response.
+                for match in re.findall(r"[\"'](?:video_url|contentUrl)[\"']\s*:\s*[\"']([^\"']{8,4096})[\"']", page_html, flags=re.IGNORECASE):
+                    media_urls.append(match)
+                normalized: list[str] = []
+                for raw in media_urls:
+                    value = html.unescape(str(raw)).replace(r"\/", "/").replace(r"\u0026", "&")
+                    value = value.replace(r"\u003D", "=").replace(r"\u003d", "=").strip()
+                    if value.startswith("//"):
+                        value = "https:" + value
+                    if _instagram_allowed_media_host(value) and value not in normalized:
+                        normalized.append(value)
+                if not normalized:
+                    errors.append("public HTML did not expose a direct video URL")
+                    continue
+
+                # Only a few metadata URLs are attempted to avoid hammering the CDN.
+                for media_url in normalized[:3]:
+                    part_path = os.path.join(workdir, f"instagram-public-{uuid.uuid4().hex[:10]}.part")
+                    try:
+                        media_response = session.get(
+                            media_url, timeout=30, stream=True, allow_redirects=False,
+                            headers={"Referer": page_url},
+                        )
+                        try:
+                            status = int(getattr(media_response, "status_code", 0))
+                            final_url = str(getattr(media_response, "url", media_url) or media_url)
+                            if status != 200 or not _instagram_allowed_media_host(final_url):
+                                errors.append(f"direct media request rejected (HTTP {status})")
+                                continue
+                            headers = getattr(media_response, "headers", {}) or {}
+                            content_type = str(headers.get("content-type", "")).split(";", 1)[0].lower().strip()
+                            length_text = str(headers.get("content-length", "")).strip()
+                            if length_text.isdigit() and int(length_text) > MAX_SOURCE_BYTES:
+                                errors.append("direct media exceeds configured source size limit")
+                                continue
+                            if content_type and not (content_type.startswith("video/") or content_type == "application/octet-stream"):
+                                errors.append("direct URL did not return video media")
+                                continue
+                            total = 0
+                            with open(part_path, "wb") as stream:
+                                iterator = getattr(media_response, "iter_content", None)
+                                if not callable(iterator):
+                                    raise RuntimeError("streaming is not supported by HTTP client")
+                                for chunk in iterator(chunk_size=1024 * 1024):
+                                    if not chunk:
+                                        continue
+                                    total += len(chunk)
+                                    if total > MAX_SOURCE_BYTES:
+                                        raise RuntimeError("direct media exceeds configured source size limit")
+                                    stream.write(chunk)
+                            if total < 1024:
+                                raise RuntimeError("direct video response was empty or too small")
+                            with open(part_path, "rb") as stream:
+                                signature = stream.read(16)
+                            if b"ftyp" not in signature and not content_type.startswith("video/"):
+                                raise RuntimeError("response did not look like a video file")
+
+                            title = next((t for t in parser.titles if t.strip()), "Instagram Reel")
+                            title = html.unescape(title).strip()
+                            title = re.sub(r"\s*[|•]\s*Instagram(?:\s+photos\s+and\s+videos)?\s*$", "", title, flags=re.IGNORECASE).strip()
+                            title = _safe_filename_title(title or "Instagram Reel")
+                            shortcode_match = re.search(r"/(?:reel|reels|p|tv)/([A-Za-z0-9_-]+)", urlparse(page_url).path, re.IGNORECASE)
+                            shortcode = shortcode_match.group(1) if shortcode_match else uuid.uuid4().hex[:8]
+                            final_path = os.path.join(workdir, f"{title[:90]} [{shortcode}]_001.mp4")
+                            if os.path.exists(final_path):
+                                final_path = os.path.join(workdir, f"{title[:80]} [{shortcode}]_{uuid.uuid4().hex[:6]}.mp4")
+                            os.replace(part_path, final_path)
+                            log.info("Instagram public HTML fallback downloaded one video using exposed metadata")
+                            return final_path, ""
+                        finally:
+                            close = getattr(media_response, "close", None)
+                            if callable(close):
+                                close()
+                    except Exception as exc:
+                        try:
+                            os.remove(part_path)
+                        except OSError:
+                            pass
+                        errors.append(f"direct video fetch failed ({type(exc).__name__})")
+                        continue
+                    finally:
+                        try:
+                            if os.path.exists(part_path):
+                                os.remove(part_path)
+                        except OSError:
+                            pass
+    except Exception as exc:
+        errors.append(f"public-page fallback failed ({type(exc).__name__})")
+
+    return None, (errors[-1] if errors else "Instagram did not expose a public direct video URL")
+
+
 def _media_template(workdir: str) -> str:
     # A bounded title is part of the actual saved filename; ID + sequence prevent collisions.
     return os.path.join(workdir, "%(title).80B [%(id)s]_%(autonumber)03d.%(ext)s")
@@ -703,6 +886,18 @@ def _download_media(
         if return_code != 0:
             break
 
+    if not subtitles and is_instagram and not files:
+        # Extra cookie-free path: some public pages expose an OG/Twitter video URL
+        # even when the extractor's media JSON is empty. This is public metadata only;
+        # no login walls or authenticated endpoints are bypassed.
+        public_file, public_error = _download_instagram_public_video_fallback(url, workdir, progress)
+        if public_file:
+            files = [public_file]
+            return_code = 0
+            tail = ["Instagram public-page metadata fallback succeeded"]
+        else:
+            log.info("Instagram public-page media fallback unavailable (%s)", public_error[:180])
+
     if not subtitles and is_instagram:
         had_no_video_formats = any("no video formats found" in line.lower() for line in tail)
         # Add photo/carousel slides when yt-dlp reports entries with no video format.
@@ -732,10 +927,13 @@ def _download_media(
         if return_code != 0 and not is_instagram:
             raise RuntimeError(_clean_ytdlp_error(tail))
         tail_message = _clean_ytdlp_error(tail)
-        if is_instagram and not subtitles and "no video formats found" in tail_message.lower():
+        if is_instagram and not subtitles:
             raise RuntimeError(
-                "Instagram exposed no video formats and the image fallback found no public files. "
-                "The post may be image-only or inaccessible to anonymous requests."
+                "Instagram did not expose a public downloadable video URL to this server. "
+                "The bot tried yt-dlp with Chrome impersonation and a public-page metadata fallback; "
+                "no Instagram cookies were used. The page may be login-gated, rate-limited, or may not "
+                "publish a direct video URL to anonymous requests. If Instagram withholds the media, "
+                "a cookie-free download cannot be guaranteed."
             )
         raise RuntimeError(tail_message or "No media files were produced.")
     for path in files:
@@ -2055,10 +2253,11 @@ async def _run_pipeline(
 
             if _is_instagram_url(url):
                 lowered = last_error.lower()
-                if any(token in lowered for token in ("empty media response", "login", "cookies", "private", "not available", "requested content is not available")):
+                if (not lowered.startswith("instagram did not expose a public downloadable video url")
+                        and any(token in lowered for token in ("empty media response", "login", "cookies", "private", "not available", "requested content is not available"))):
                     last_error = (
-                        "Instagram did not expose this reel to anonymous server requests. The bot tried the original and a clean public URL without requiring cookies, but Instagram may be login-gating or rate-limiting this post. "
-                        "Try again later or use a reel that is publicly accessible without signing in; the bot cannot guarantee downloads when Instagram blocks unauthenticated access."
+                        "Instagram did not expose downloadable video data to this server. The bot used the current yt-dlp extractor with browser impersonation and also checked the public page metadata; no Instagram cookies were used. "
+                        "Instagram may require sign-in, rate-limit this hosting IP, or omit a direct video URL. Try again later or use media that opens publicly while signed out. Downloads cannot be guaranteed when Instagram withholds anonymous access."
                     )
             await safe_edit(status, f"Download failed: {last_error}")
             schedule_auto_delete(context, status, reset=True)
