@@ -33,7 +33,9 @@ N14L18 is a Telegram bot for downloading supported public media links through an
 
 ## Sequential Link Queue and YouTube Error Handling
 
-- Plain media links enter one FIFO queue automatically, including URLs sent in separate messages while a download is running.
+- A single YouTube video/Short opens a quality-selection menu before download. If metadata lookup is blocked/unavailable, the bot still shows generic options (1080p through 144p, Best available, saved default, and MP3) instead of silently downloading automatically.
+- Multiple URLs in one message enter the FIFO queue automatically. Rapid follow-up YouTube links sent within 45 seconds of an open quality menu are queued using the saved default so sequential bulk sending remains practical; use `/choose URL` to explicitly open a one-off menu.
+- Non-YouTube media links (including Instagram) enter the FIFO queue automatically, including URLs sent in separate messages while a download is running.
 - Only one download runs at a time. Updates are accepted sequentially so rapidly sent messages enter the FIFO queue in Telegram update order. The default queue holds up to 100 waiting jobs; `MAX_PENDING_QUEUE` is configurable up to 200. `MAX_BATCH_LINKS` limits URLs in a single message. The waiting queue is in memory; jobs still waiting when the service restarts are not durable.
 - Playlists are expanded within the configured limit and their items are downloaded sequentially. Pending in-memory jobs are lost if the service restarts; resend those links after restart.
 - When YouTube responds with “Sign in to confirm you're not a bot”, the bot shows a clear source-access error, stops wasteful format retries, and pauses additional YouTube jobs for 10 minutes by default. Instagram jobs continue. This is a YouTube verification/rate-limit response, not a quality-selection bug; code cannot guarantee anonymous access when YouTube withholds the stream.
@@ -100,7 +102,7 @@ Do not put real tokens, cookies, database passwords, or other credentials in sou
 
 1. Open your bot in Telegram and send `/start`.
 2. Send a supported public media URL to see the available download workflow.
-3. Send `/q` or `/quality` to set the default YouTube resolution, or `/choose URL` to select a quality for one video. Use Best available for the source maximum.
+3. Send a single YouTube video/Short link to open its quality menu. Use `/q` or `/quality` to set the saved default, `/auto` to set Best available up to 1080p, or `/choose URL` to open a one-time menu explicitly. When batching rapid follow-up links, the saved default is used for queued jobs.
 4. For multiple links, send several URLs in one message. They are processed sequentially up to the configured batch limit.
 5. For a playlist, use `/playlist <URL>`.
 6. Downloaded media remains in chat. Temporary bot messages are scheduled for cleanup after the configured period.
@@ -111,7 +113,7 @@ Do not put real tokens, cookies, database passwords, or other credentials in sou
 | --- | --- |
 | `/start` | Open the bot's welcome/help menu. |
 | `/q`, `/quality` | Set the default maximum YouTube resolution (1080p through 144p (maximum 1080p)) or Best available. |
-| `/auto` | Set Best available as your default; no fixed resolution ceiling. |
+| `/auto` | Set Best available as your default, capped at 1080p. |
 | `/audio <URL>` | Download audio as MP3 when supported. |
 | `/sub <URL>` | Request subtitles when the source provides them. |
 | `/playlist <URL>` | Process a supported playlist sequentially, within the configured limit. |

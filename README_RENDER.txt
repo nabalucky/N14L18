@@ -1,6 +1,6 @@
-N14L18 Media Bot — Render deployment bundle (v12.6.1)
+N14L18 Media Bot — Render deployment bundle (v12.6.2)
 
-V12.6.1 REVIEWED BUILD
+V12.6.2 QUALITY-MENU FIX
 - YouTube maximum quality is 1080p. Options are 1080p, 720p, 480p, 360p, 240p, 144p,
   plus Best available capped at 1080p. 2K/4K options are removed.
 - `/debug URL` is restricted to configured admin IDs. Its YouTube cookie argument is now guarded
@@ -16,6 +16,7 @@ V12.6.1 REVIEWED BUILD
 - Hardened quality callbacks to accept only supported resolution values. Added explicit webhook request size, path, and secret-header checks. If YouTube metadata lookup throws an error, the bot falls back to automatic download instead of leaving the user stuck at the preview stage.
 
 FEATURES
+- Single YouTube video/Short links open a quality menu before downloading; multiple links and rapid follow-up links continue to use the FIFO queue. If metadata lookup fails, a generic quality menu is shown instead of silently starting an automatic download.
 - YouTube quality menu, automatic quality, MP3 audio, thumbnail preview, playback-friendly MP4 preparation, progress, statistics and history.
 - Best-effort public Instagram reel/video/carousel downloads with image fallback. The code uses yt-dlp browser impersonation plus a public-HTML metadata fallback; neither uses Instagram cookies or bypasses login walls. Instagram may still block anonymous requests or the hosting IP.
 - Sequential queue for up to 10 links per message, capped playlist expansion, and split large media into Telegram-uploadable parts.
@@ -23,14 +24,14 @@ FEATURES
 - Temporary link, status, error and menu messages are scheduled for deletion. Progress/status edits renew the TTL while the job is active; when a job finishes, the final status expires after 10 minutes. Media files deliberately remain in chat.
 
 FILES
-- bot.py: v12.6.1 1080p quality cap, FIFO queue, and guarded debug-cookie handling
+- bot.py: v12.6.2 1080p quality cap, FIFO queue, cookie-guarded diagnostics, and per-video YouTube quality menu
 - requirements.txt: pinned python-telegram-bot and yt-dlp release, curl-cffi, gallery-dl and PostgreSQL client
 - Dockerfile: Python 3.12, FFmpeg, Deno and Python dependency installation
 - render.yaml: Docker Blueprint settings with webhook mode and safe size/queue defaults
 - README_RENDER.txt: deployment notes and environment variables
 
 IMPORTANT: WHAT THE UPLOADED LOGS SHOWED
-- Earlier uploaded logs showed an older build. After deployment, verify that logs report `Bot version: v12.6.1-debug-cookie-guard` before testing.
+- Earlier uploaded logs showed an older build. After deployment, verify that logs report `Bot version: v12.6.2-quality-menu-default` before testing.
 - Another log reports a Telegram polling conflict. Exactly one live service/process may consume updates for this bot token. Before switching to webhook mode, stop any duplicate polling service/process using the same token, or the old poller can keep producing 409 conflicts.
 - The uploaded Render build command included an unrecognized remote `curl ... | sh` installer from `folkapp.link`. The included Dockerfile installs Deno from its official GitHub release and does not need that custom shell installer. Remove the custom build command and deploy using the provided Docker runtime/Blueprint. Do not run an unknown script piped directly to a shell.
 - If the bot token was ever exposed in logs or public code, revoke it with BotFather and update BOT_TOKEN in Render before testing.
@@ -42,7 +43,7 @@ DEPLOYMENT
 4. Stop every duplicate service/process using this token first. Then set TELEGRAM_MODE=webhook. On Render, RENDER_EXTERNAL_URL is used automatically; if your provider does not set that variable, set WEBHOOK_URL to the HTTPS base URL such as `https://your-service.onrender.com` (do not include `/telegram`).
 5. TELEGRAM_WEBHOOK_SECRET is optional. If not provided, the bot derives a valid secret header token from BOT_TOKEN. For better secret separation, set an independent random secret containing only letters, digits, underscores or hyphens (maximum 256 characters).
 6. For deletion recovery across Render restarts/redeploys, create a Render Postgres database and add its connection string as DATABASE_URL. Without it the bot logs a warning and uses local state only. Render Free local files are ephemeral; the Free Postgres tier currently expires after 30 days, so it is not permanent storage.
-7. Deploy and check logs for `Bot version: v12.6.1-debug-cookie-guard`, `Telegram transport mode: webhook`, `Telegram webhook registered`, and `Auto-delete scheduled ...`. Test a short public YouTube video first, then an Instagram Reel that opens without signing in. Instagram may still withhold media from data-center/server IPs; this version does not use Instagram cookies and cannot override such restrictions.
+7. Deploy and check logs for `Bot version: v12.6.2-quality-menu-default`, `Telegram transport mode: webhook`, `Telegram webhook registered`, and `Auto-delete scheduled ...`. Test a short public YouTube video first, then an Instagram Reel that opens without signing in. Instagram may still withhold media from data-center/server IPs; this version does not use Instagram cookies and cannot override such restrictions.
 8. Uploaded videos/audio/photos/documents are not auto-deleted. Only temporary bot text/menu/status messages and the source-link/command messages are scheduled; Telegram may reject deletion if permissions or message-age restrictions prevent it.
 
 ENVIRONMENT VARIABLES
@@ -80,7 +81,7 @@ KNOWN LIMITATIONS
 - Full VP9/AV1-to-H.264 conversion may be CPU-intensive; conversion has a bounded timeout and the bot can fall back to a playable-as-document original format rather than always re-encoding.
 - Downloader sites can change after release. Live Telegram, YouTube and Instagram end-to-end behavior must still be verified after deployment.
 
-V12.6.1 OFFLINE QA
+V12.6.2 OFFLINE QA
 - Python syntax compilation passed.
 - Public HTML fallback only permits direct HTTPS media URLs hosted on cdninstagram.com or fbcdn.net, enforces the source-size cap, and never reads Instagram cookies.
 - Docker build checks that yt-dlp has a Chrome impersonation target.
@@ -94,17 +95,24 @@ INSTAGRAM COOKIE-FREE LIMITATION
 
 QUEUE AND YOUTUBE VERIFICATION BEHAVIOUR
 -------------------------------------------
-* All plain URL messages enter one FIFO queue; later messages are not rejected while a download is active.
+* Non-YouTube URLs automatically enter the FIFO queue. A single YouTube video/Short opens a quality menu first; multi-link messages and rapid follow-up YouTube links are queued automatically using the saved default.
 * One worker processes queued links sequentially, default capacity 100 waiting jobs.
 * YouTube's explicit anonymous bot/verification refusal is shown clearly and stops repeated quality attempts. Further YouTube requests pause for 10 minutes by default after the challenge; Instagram jobs continue. The bot does not bypass source identity checks.
-* Current quality settings are documented below in the v12.6.1 section.
+* Current quality settings are documented below in the v12.6.2 section.
 * Pending queued jobs are in memory and are lost if the hosting service restarts.
 
 Environment variable: `YOUTUBE_VERIFICATION_COOLDOWN_SECONDS` (default `600`, maximum `3600`) controls the pause after YouTube explicitly challenges anonymous requests. Set it to `0` to disable the pause.
 
 
-YOUTUBE QUALITY SETTINGS (v12.6.1)
+YOUTUBE QUALITY SETTINGS (v12.6.2)
 --------------------------------
 Use /q or /quality to set the per-user default quality (1080p, 720p, 480p, 360p, 240p, 144p, or Best available). Maximum video resolution is capped at 1080p; 1440p (2K) and 2160p (4K) are not offered or downloaded. /auto sets Best available up to 1080p. Use /choose URL for a one-time selection; the per-video menu includes available resolutions up to 1080p, Best available up to 1080p, and Use my default. The selected default is captured when a job is queued, so changing settings affects newly queued links.
 
 DEFAULT_VIDEO_QUALITY defaults to 'best' (maximum 1080p) for users without a saved preference. User preferences are saved to QUALITY_PREFERENCES_FILE locally. When DATABASE_URL is configured, the bot also stores preferences in PostgreSQL so they can survive Render restarts/redeploys. Without PostgreSQL, the local file may be lost on Render Free instance replacement.
+
+QUALITY MENU ROUTING FIX (v12.6.2)
+--------------------------------
+- A single YouTube video/Short no longer goes straight into the download queue by default; it opens the one-video quality menu first.
+- If yt-dlp metadata lookup fails or provides no enumerated video formats, the bot shows generic supported quality choices instead of silently starting automatic download.
+- Multiple links in one message, playlists, Instagram links, and rapid follow-up YouTube links preserve the sequential queue workflow.
+- The supplied Render log's FFmpeg timeout was also reviewed: the 120-second transcode limit was reached and the existing original-media fallback was used. This is a bounded-resource fallback, not the reason the quality menu was skipped.

@@ -61,7 +61,7 @@ MAX_PLAYLIST = max(1, min(int(os.environ.get("MAX_PLAYLIST", "10")), 20))
 MAX_BATCH_LINKS = max(1, min(int(os.environ.get("MAX_BATCH_LINKS", "10")), 20))
 MAX_PENDING_QUEUE = max(20, min(int(os.environ.get("MAX_PENDING_QUEUE", "100")), 200))
 YOUTUBE_VERIFICATION_COOLDOWN = max(0, min(int(os.environ.get("YOUTUBE_VERIFICATION_COOLDOWN_SECONDS", "600")), 3600))
-BOT_VERSION = "v12.6.1-debug-cookie-guard"
+BOT_VERSION = "v12.6.2-quality-menu-default"
 USER_COOLDOWN = max(0, int(os.environ.get("USER_COOLDOWN_SECONDS", "15")))
 DOWNLOAD_TIMEOUT = max(90, int(os.environ.get("DOWNLOAD_TIMEOUT_SECONDS", "480")))
 FFMPEG_TIMEOUT = max(60, int(os.environ.get("FFMPEG_TIMEOUT_SECONDS", "240")))
@@ -171,7 +171,7 @@ SERVICE_BOOT_TIME = time.monotonic()
 
 WELCOME = (
     "Hi! Send a public video or reel URL and I'll try to download it.\n\n"
-    "All links enter a sequential queue automatically. Send more links while a download is running; they will wait their turn.\n\n"
+    "A single YouTube video/Short opens a quality menu before downloading. Send multiple links in one message, or send rapid follow-up links, to queue downloads automatically in order.\n\n"
     "Commands:\n"
     "/audio URL — queue audio extraction as MP3\n"
     "/sub URL — queue available English/Hindi subtitles\n"
@@ -2783,6 +2783,29 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     was_truncated = len(urls) > MAX_BATCH_LINKS
     if was_truncated:
         urls = urls[:MAX_BATCH_LINKS]
+
+    # A single YouTube video/Short must show the quality menu instead of silently
+    # downloading with the automatic default. Keep playlist and multi-link messages
+    # on the FIFO path so bulk jobs continue to process without extra taps.
+    user = update.effective_user
+    if (len(urls) == 1 and user is not None
+            and _is_youtube_url(urls[0])
+            and _youtube_video_id(urls[0])
+            and not _is_youtube_playlist_url(urls[0])):
+        now = time.monotonic()
+        recent_menu_open = any(
+            entry.get("uid") == user.id
+            and 0 <= now - float(entry.get("created", 0)) <= 45
+            for entry in _PENDING.values()
+        )
+        if not recent_menu_open:
+            log.info("Opening YouTube quality menu for one video/Short; metadata lookup may use generic options")
+            await youtube_menu(update, context, urls[0])
+            return
+        # Rapid follow-up YouTube links are queued behind the most recent menu/job,
+        # using the user's saved default so bulk sending remains hands-free.
+        # A user can always use /choose URL for an explicit one-off menu.
+
     # Enqueue before any warning await so later Telegram messages cannot jump ahead.
     await download_batch_job(update, context, urls)
     if was_truncated:
@@ -2814,20 +2837,36 @@ async def youtube_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, url: 
             context.bot_data["pool"], lambda: _get_video_meta(url)
         )
     except Exception as exc:
-        log.warning("YouTube quality metadata lookup failed (%s); falling back to automatic download",
+        log.warning("YouTube quality metadata lookup failed (%s); showing generic quality menu",
                     type(exc).__name__)
         meta = None
+
+    metadata_available = bool(meta)
+    formats_available = bool(meta and meta.get("heights"))
     if not meta:
-        try:
-            await status.delete()
-            cancel_auto_delete(status)
-        except TelegramError:
-            schedule_auto_delete(context, status, reset=True)
-        await download_job(update, context, url)
-        return
+        # Metadata probing can fail even when a later cookie-authenticated download
+        # works. Never silently start an automatic download just because probing failed.
+        video_id_hint = _youtube_video_id(url)
+        meta = {
+            "title": f"YouTube video ({video_id_hint})" if video_id_hint else "YouTube video",
+            "duration": 0,
+            "thumbnail": None,
+            "heights": list(QUALITY_LEVELS),
+            "sizes": {},
+        }
+        log.info("Showing generic YouTube quality menu because format metadata was unavailable")
 
     options: list[tuple[str, str]] = []
-    for height in meta["heights"]:
+    # If yt-dlp returns metadata but no enumerated video formats, still show the
+    # supported resolution choices and let the selected downloader selector decide.
+    raw_heights = meta.get("heights") or list(QUALITY_LEVELS)
+    menu_heights = sorted(
+        {int(h) for h in raw_heights if str(h).isdigit() and int(h) in QUALITY_LEVELS},
+        reverse=True,
+    )
+    if not menu_heights:
+        menu_heights = list(QUALITY_LEVELS)
+    for height in menu_heights:
         size = int(meta["sizes"].get(str(height), 0))
         label_size = f" — {size / 1048576:.1f} MiB" if size else ""
         selector = _quality_selector(height)
@@ -2880,6 +2919,8 @@ async def youtube_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, url: 
     if duration:
         caption += f"\nDuration: {duration // 60}:{duration % 60:02d}"
     caption += "\nChoose a one-time resolution, Best available, or Use my default. /q changes your default for future links."
+    if not metadata_available or not formats_available:
+        caption += "\nFormat details could not be loaded, so file sizes are unavailable. The selected option will be tried when you tap a button."
     try:
         await status.delete()
         cancel_auto_delete(status)
