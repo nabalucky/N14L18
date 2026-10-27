@@ -110,7 +110,7 @@ Do not put real tokens, cookies, database passwords, or other credentials in sou
 | Command | Purpose |
 | --- | --- |
 | `/start` | Open the bot's welcome/help menu. |
-| `/q`, `/quality` | Set the default maximum YouTube resolution (2160p through 144p) or Best available. |
+| `/q`, `/quality` | Set the default maximum YouTube resolution (1080p through 144p (maximum 1080p)) or Best available. |
 | `/auto` | Set Best available as your default; no fixed resolution ceiling. |
 | `/audio <URL>` | Download audio as MP3 when supported. |
 | `/sub <URL>` | Request subtitles when the source provides them. |
@@ -135,7 +135,7 @@ Set configuration in your hosting dashboard or local environment. Do not hard-co
 | `TELEGRAM_WEBHOOK_PATH` | `telegram` | HTTP route suffix used by the webhook. |
 | `TELEGRAM_WEBHOOK_SECRET` | Derived from the bot token if omitted | Optional separate webhook secret; use letters, digits, `_` or `-`, up to 256 characters. |
 | `DATABASE_URL` | Optional | PostgreSQL connection string for restart-resilient pending-message deletion records and saved per-user quality preferences. Recommended for hosted deployments. |
-| `DEFAULT_VIDEO_QUALITY` | `best` | Default quality for users who have not selected a preference: `best`, `2160`, `1440`, `1080`, `720`, `480`, `360`, `240`, or `144`. User-selected defaults override this value. |
+| `DEFAULT_VIDEO_QUALITY` | `best` | Default quality for users who have not selected a preference: `best`, `1080`, `720`, `480`, `360`, `240`, or `144`. User-selected defaults override this value. |
 | `QUALITY_PREFERENCES_FILE` | `/tmp/dlbot_quality_preferences.json` | Local fallback for per-user quality settings when PostgreSQL is not configured. Ephemeral hosting storage may be cleared on restart/redeploy. |
 | `AUTO_DELETE_SECONDS` | `600` | Lifetime for eligible temporary messages; default is 10 minutes. |
 | `MAX_UPLOAD_MIB` | `45` | Target maximum size for each Telegram upload part. |

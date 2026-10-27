@@ -61,7 +61,7 @@ MAX_PLAYLIST = max(1, min(int(os.environ.get("MAX_PLAYLIST", "10")), 20))
 MAX_BATCH_LINKS = max(1, min(int(os.environ.get("MAX_BATCH_LINKS", "10")), 20))
 MAX_PENDING_QUEUE = max(20, min(int(os.environ.get("MAX_PENDING_QUEUE", "100")), 200))
 YOUTUBE_VERIFICATION_COOLDOWN = max(0, min(int(os.environ.get("YOUTUBE_VERIFICATION_COOLDOWN_SECONDS", "600")), 3600))
-BOT_VERSION = "v12.5-quality-controls"
+BOT_VERSION = "v12.6.1-debug-cookie-guard"
 USER_COOLDOWN = max(0, int(os.environ.get("USER_COOLDOWN_SECONDS", "15")))
 DOWNLOAD_TIMEOUT = max(90, int(os.environ.get("DOWNLOAD_TIMEOUT_SECONDS", "480")))
 FFMPEG_TIMEOUT = max(60, int(os.environ.get("FFMPEG_TIMEOUT_SECONDS", "240")))
@@ -73,7 +73,8 @@ AUTO_DELETE_SECONDS = max(60, int(os.environ.get("AUTO_DELETE_SECONDS", "600")))
 MAX_PARTS = 128
 MAX_SPLIT_DEPTH = 8
 WORK_DIR = os.environ.get("WORK_DIR", "/tmp")
-QUALITY_LEVELS = (2160, 1440, 1080, 720, 480, 360, 240, 144)
+MAX_VIDEO_HEIGHT = 1080
+QUALITY_LEVELS = (1080, 720, 480, 360, 240, 144)
 QUALITY_PREFERENCES_FILE = os.environ.get(
     "QUALITY_PREFERENCES_FILE", os.path.join(WORK_DIR, "dlbot_quality_preferences.json")
 )
@@ -84,9 +85,9 @@ else:
     try:
         DEFAULT_VIDEO_QUALITY_VALUE = int(_DEFAULT_VIDEO_QUALITY_RAW)
     except ValueError as exc:
-        raise RuntimeError("DEFAULT_VIDEO_QUALITY must be 'best' or one of: 2160, 1440, 1080, 720, 480, 360, 240, 144") from exc
+        raise RuntimeError("DEFAULT_VIDEO_QUALITY must be 'best' or one of: 1080, 720, 480, 360, 240, 144") from exc
     if DEFAULT_VIDEO_QUALITY_VALUE not in QUALITY_LEVELS:
-        raise RuntimeError("DEFAULT_VIDEO_QUALITY must be 'best' or one of: 2160, 1440, 1080, 720, 480, 360, 240, 144")
+        raise RuntimeError("DEFAULT_VIDEO_QUALITY must be 'best' or one of: 1080, 720, 480, 360, 240, 144")
 # Pending message deletions survive an in-process restart when this state file survives.
 # Render Free storage is ephemeral across instance replacement/redeploy.
 AUTO_DELETE_STATE_FILE = os.environ.get("AUTO_DELETE_STATE_FILE", os.path.join(WORK_DIR, "dlbot_auto_delete.json"))
@@ -216,7 +217,7 @@ def _normalize_quality_preference(value: Any) -> int | None:
     except (TypeError, ValueError) as exc:
         raise ValueError("Unsupported quality preference.") from exc
     if height not in QUALITY_LEVELS:
-        raise ValueError("Choose best available or one of: 2160p, 1440p, 1080p, 720p, 480p, 360p, 240p, 144p.")
+        raise ValueError("Choose best available (up to 1080p) or one of: 1080p, 720p, 480p, 360p, 240p, 144p.")
     return height
 
 
@@ -1196,7 +1197,7 @@ def _get_video_meta(url: str) -> dict[str, Any] | None:
             for fmt in info.get("formats", []):
                 height = fmt.get("height")
                 vcodec = fmt.get("vcodec")
-                if not height or height < 144 or height > 2160 or not vcodec or vcodec == "none":
+                if not height or height < 144 or height > MAX_VIDEO_HEIGHT or not vcodec or vcodec == "none":
                     continue
                 size = int(fmt.get("filesize") or fmt.get("filesize_approx") or 0)
                 current = vids.get(int(height))
@@ -1220,7 +1221,7 @@ def _quality_selector(height: int) -> str:
     The requested height is a ceiling: if 1080p is only available as VP9/AV1,
     prefer an available lower-resolution AVC stream over forcing a slow transcode.
     """
-    h = max(144, min(int(height), 2160))
+    h = max(144, min(int(height), MAX_VIDEO_HEIGHT))
     return (
         f"bv*[height={h}][ext=mp4][vcodec^=avc1]+ba[ext=m4a][acodec^=mp4a]/"
         f"b[height={h}][ext=mp4][vcodec^=avc1]/"
@@ -1238,12 +1239,13 @@ def _format_chain(
 ) -> list[str]:
     """Build explicit format fallbacks for a one-time choice or saved user default.
 
-    None means best available with no resolution ceiling. An integer means a maximum
+    None means best available capped at 1080p. An integer means a maximum
     resolution; lower choices are only attempted if the chosen format cannot be used.
     """
     if force_fmt:
         if force_fmt == "best":
-            return ["best", *(_quality_selector(h) for h in (2160, 1440, 1080, 720, 480, 360, 240, 144))]
+            # Best available is intentionally capped at 1080p for predictable size and bandwidth.
+            return [f"bestvideo[height<={MAX_VIDEO_HEIGHT}]+bestaudio/best[height<={MAX_VIDEO_HEIGHT}]", *(_quality_selector(h) for h in QUALITY_LEVELS)]
         match = re.search(r"height[<]?=?([0-9]+)", force_fmt)
         max_height = int(match.group(1)) if match else 1080
         heights = [h for h in QUALITY_LEVELS if h < max_height]
@@ -1251,12 +1253,11 @@ def _format_chain(
 
     preferred = _get_quality_preference(user_id) if preferred_override is _QUALITY_PREF_UNSET else preferred_override
     if preferred is None:
-        # yt-dlp's normal best selection is the true best available format. Later
-        # selectors provide resolution fallbacks if extraction/preparation fails.
-        return ["best", *(_quality_selector(h) for h in QUALITY_LEVELS)]
+        # Best available is capped at 1080p; later selectors provide compatible fallbacks.
+        return [f"bestvideo[height<={MAX_VIDEO_HEIGHT}]+bestaudio/best[height<={MAX_VIDEO_HEIGHT}]", *(_quality_selector(h) for h in QUALITY_LEVELS)]
     max_height = _normalize_quality_preference(preferred)
     if max_height is None:
-        return ["best", *(_quality_selector(h) for h in QUALITY_LEVELS)]
+        return [f"bestvideo[height<={MAX_VIDEO_HEIGHT}]+bestaudio/best[height<={MAX_VIDEO_HEIGHT}]", *(_quality_selector(h) for h in QUALITY_LEVELS)]
     heights = [h for h in QUALITY_LEVELS if h <= max_height]
     selectors = [_quality_selector(h) for h in heights]
     selectors.append(f"best[height<={max_height}]")
@@ -2946,7 +2947,7 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 if len(fields) != 4:
                     raise ValueError("invalid quality callback")
                 height, owner = int(fields[2]), int(fields[3])
-                if height < 144 or height > 2160 or height % 2:
+                if height < 144 or height > MAX_VIDEO_HEIGHT or height % 2:
                     raise ValueError("unsupported quality")
             else:
                 if len(fields) != 3:
@@ -2991,7 +2992,7 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await asyncio.to_thread(_set_quality_preference_sync, query.from_user.id, normalized)
         await reply_text_auto(
             context, query.message,
-            f"Default YouTube quality saved: {_quality_preference_label(normalized)}. Future links will use this setting."
+            f"Default YouTube quality saved: {_quality_preference_label(normalized)}. Maximum supported resolution is 1080p."
         )
         return
     if not data.startswith("pick_"):
@@ -3031,7 +3032,6 @@ async def send_quality_menu(message, context: ContextTypes.DEFAULT_TYPE, user_id
     uid = int(user_id) if user_id is not None else None
     current = _quality_preference_label(_get_quality_preference(uid)) if uid is not None else _quality_preference_label(DEFAULT_VIDEO_QUALITY_VALUE)
     rows = [
-        [InlineKeyboardButton("2160p", callback_data="setq_2160"), InlineKeyboardButton("1440p", callback_data="setq_1440")],
         [InlineKeyboardButton("1080p", callback_data="setq_1080"), InlineKeyboardButton("720p", callback_data="setq_720")],
         [InlineKeyboardButton("480p", callback_data="setq_480"), InlineKeyboardButton("360p", callback_data="setq_360")],
         [InlineKeyboardButton("240p", callback_data="setq_240"), InlineKeyboardButton("144p", callback_data="setq_144")],
@@ -3040,9 +3040,9 @@ async def send_quality_menu(message, context: ContextTypes.DEFAULT_TYPE, user_id
     keyboard = InlineKeyboardMarkup(rows)
     text = (
         f"Your default YouTube quality: {current}\n\n"
-        "Choose a maximum resolution for future video and Shorts links. This is your saved default; "
+        "Choose a maximum resolution for future video and Shorts links (1080p maximum). This is your saved default; "
         "videos may download at a lower resolution when the source has no matching format.\n\n"
-        "⚡ Best available removes the resolution cap and lets yt-dlp choose the best format exposed by the source.\n"
+        "⚡ Best available selects the highest compatible format up to 1080p. 1440p and 2160p are disabled.\n"
         "For a one-time choice, use /choose followed by a YouTube URL."
     )
     await reply_text_auto(context, message, text, reply_markup=keyboard)
@@ -3061,7 +3061,7 @@ async def handle_auto(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not uid:
         return
     await asyncio.to_thread(_set_quality_preference_sync, uid, None)
-    await reply_text_auto(context, update.effective_message, "Default quality set to Best available. Future videos use the best format exposed by the source.")
+    await reply_text_auto(context, update.effective_message, "Default quality set to Best available (maximum 1080p). Future videos use the highest compatible format up to 1080p.")
 
 
 async def handle_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3144,7 +3144,9 @@ async def handle_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await reply_text_auto(context, update.effective_message, "Checking downloader and JavaScript runtime…")
     with tempfile.TemporaryDirectory(prefix="dldebug_", dir=WORK_DIR) as td:
         command = ["yt-dlp", "--ignore-config", "-F", "--no-playlist", "--verbose", "--remote-components", "ejs:github"]
-        command += _cookie_args(td)
+        # YouTube session cookies must never be passed to non-YouTube diagnostics.
+        if _is_youtube_url(url):
+            command += _cookie_args(td)
         command.append(url)
         try:
             result = await asyncio.get_running_loop().run_in_executor(
