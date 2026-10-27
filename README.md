@@ -31,6 +31,15 @@ N14L18 is a Telegram bot for downloading supported public media links through an
 | **Temporary-message cleanup** | Automatically schedule eligible link, menu, status, and error messages for deletion. Media files deliberately remain in chat. |
 | **Webhook-ready deployment** | Includes a Docker image setup and Render Blueprint configuration, with webhook mode intended for Render deployments. |
 
+## Sequential Link Queue and YouTube Error Handling
+
+- Plain media links enter one FIFO queue automatically, including URLs sent in separate messages while a download is running.
+- Only one download runs at a time. Updates are accepted sequentially so rapidly sent messages enter the FIFO queue in Telegram update order. The default queue holds up to 100 waiting jobs; `MAX_PENDING_QUEUE` is configurable up to 200. `MAX_BATCH_LINKS` limits URLs in a single message. The waiting queue is in memory; jobs still waiting when the service restarts are not durable.
+- Playlists are expanded within the configured limit and their items are downloaded sequentially. Pending in-memory jobs are lost if the service restarts; resend those links after restart.
+- When YouTube responds with “Sign in to confirm you're not a bot”, the bot shows a clear source-access error, stops wasteful format retries, and pauses additional YouTube jobs for 10 minutes by default. Instagram jobs continue. This is a YouTube verification/rate-limit response, not a quality-selection bug; code cannot guarantee anonymous access when YouTube withholds the stream.
+- YouTube cookies remain optional and are passed only to YouTube URLs if configured in the hosting environment. Never put credentials or cookies in source code, chats, or GitHub.
+- Use `/q` or `/auto` to set your preferred quality behavior. Use `/choose URL` to open the per-video resolution menu. Normal sent links auto-download using the selected preference.
+
 ## Supported Sources
 
 - **YouTube** — video quality choices, automatic quality, audio extraction, and bounded playlist processing where supported.
@@ -131,6 +140,8 @@ Set configuration in your hosting dashboard or local environment. Do not hard-co
 | `MAX_SOURCE_MIB` | `1024` | Maximum accepted source size in MiB. |
 | `MAX_PLAYLIST` | `10` | Playlist item limit; hard-capped at 20. |
 | `MAX_BATCH_LINKS` | `10` | Maximum URLs processed from one message; hard-capped at 20. |
+| `MAX_PENDING_QUEUE` | `100` | Maximum number of waiting jobs; hard-capped at 200. |
+| `YOUTUBE_VERIFICATION_COOLDOWN_SECONDS` | `600` | Pause additional YouTube requests after an explicit verification challenge; set to `0` to disable (maximum 3600 seconds). |
 | `USER_COOLDOWN_SECONDS` | `15` | Per-user cooldown between jobs. |
 | `DOWNLOAD_TIMEOUT_SECONDS` | `480` | Download operation timeout in seconds. |
 | `FFMPEG_TIMEOUT_SECONDS` | `240` | FFmpeg operation timeout in seconds. |

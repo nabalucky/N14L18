@@ -59,7 +59,9 @@ MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_MIB", "45")) * 1024 * 1024
 MAX_SOURCE_BYTES = int(os.environ.get("MAX_SOURCE_MIB", "1024")) * 1024 * 1024
 MAX_PLAYLIST = max(1, min(int(os.environ.get("MAX_PLAYLIST", "10")), 20))
 MAX_BATCH_LINKS = max(1, min(int(os.environ.get("MAX_BATCH_LINKS", "10")), 20))
-BOT_VERSION = "v12.3-cookiefree-instagram-fallback"
+MAX_PENDING_QUEUE = max(20, min(int(os.environ.get("MAX_PENDING_QUEUE", "100")), 200))
+YOUTUBE_VERIFICATION_COOLDOWN = max(0, min(int(os.environ.get("YOUTUBE_VERIFICATION_COOLDOWN_SECONDS", "600")), 3600))
+BOT_VERSION = "v12.4-youtube-error-queue-fix"
 USER_COOLDOWN = max(0, int(os.environ.get("USER_COOLDOWN_SECONDS", "15")))
 DOWNLOAD_TIMEOUT = max(90, int(os.environ.get("DOWNLOAD_TIMEOUT_SECONDS", "480")))
 FFMPEG_TIMEOUT = max(60, int(os.environ.get("FFMPEG_TIMEOUT_SECONDS", "240")))
@@ -152,16 +154,18 @@ SERVICE_BOOT_TIME = time.monotonic()
 
 WELCOME = (
     "Hi! Send a public video or reel URL and I'll try to download it.\n\n"
+    "All links enter a sequential queue automatically. Send more links while a download is running; they will wait their turn.\n\n"
     "Commands:\n"
-    "/audio URL — download audio as MP3\n"
-    "/sub URL — download available English/Hindi subtitles\n"
-    "/playlist URL — download up to the configured playlist limit\n"
-    f"Send up to {MAX_BATCH_LINKS} links in one message for sequential downloads.\n"
-    "/q — choose a preferred video quality\n"
+    "/audio URL — queue audio extraction as MP3\n"
+    "/sub URL — queue available English/Hindi subtitles\n"
+    "/playlist URL — queue a bounded playlist\n"
+    "/choose URL — open the per-video quality menu\n"
+    f"Send up to {MAX_BATCH_LINKS} links in one message; up to {MAX_PENDING_QUEUE} jobs can wait in the queue.\n"
+    "/q — choose a preferred maximum video quality\n"
     "/auto — return to automatic quality selection\n"
     "/stats — view your download statistics\n"
     "/history — show your last five links\n"
-    "/again NUMBER — download a recent link again\n"
+    "/again NUMBER — queue a recent link again\n"
     "/disk — show temporary disk usage\n\n"
     "Please download only media you own or have permission to save."
 )
@@ -419,6 +423,62 @@ def _run_capture(command: list[str], timeout: int) -> subprocess.CompletedProces
         env=_base_env(),
         check=False,
     )
+
+
+def _is_youtube_bot_check(output: str | list[str]) -> bool:
+    """Recognize YouTube's explicit sign-in-to-confirm request without exposing its raw log."""
+    text = "\n".join(output) if isinstance(output, list) else str(output)
+    lowered = text.lower()
+    return (
+        "sign in to confirm you're not a bot" in lowered
+        or "sign in to confirm you’re not a bot" in lowered
+        or "confirm you're not a bot" in lowered
+        or "confirm you’re not a bot" in lowered
+    )
+
+
+_YOUTUBE_VERIFICATION_BLOCK_UNTIL = 0.0
+
+
+def _is_youtube_verification_error(output: str | list[str]) -> bool:
+    """Recognize raw yt-dlp text and the bot's already-normalized error message."""
+    text = "\n".join(output) if isinstance(output, list) else str(output)
+    lowered = text.lower()
+    return (
+        _is_youtube_bot_check(text)
+        or "youtube refused this server's anonymous request" in lowered
+        or "youtube has challenged this bot's server request with an anti-bot verification check" in lowered
+    )
+
+
+def _youtube_verification_cooldown_remaining() -> int:
+    return max(0, int(_YOUTUBE_VERIFICATION_BLOCK_UNTIL - time.monotonic() + 0.99))
+
+
+def _record_youtube_verification_challenge() -> None:
+    """Pause repeated YouTube requests after an explicit source-side verification challenge."""
+    global _YOUTUBE_VERIFICATION_BLOCK_UNTIL
+    if YOUTUBE_VERIFICATION_COOLDOWN > 0:
+        _YOUTUBE_VERIFICATION_BLOCK_UNTIL = max(
+            _YOUTUBE_VERIFICATION_BLOCK_UNTIL,
+            time.monotonic() + YOUTUBE_VERIFICATION_COOLDOWN,
+        )
+        log.warning(
+            "YouTube anonymous verification challenge detected; pausing further YouTube requests for %s seconds",
+            YOUTUBE_VERIFICATION_COOLDOWN,
+        )
+
+
+def _friendly_youtube_error(lines: list[str]) -> str:
+    """Explain that the source is withholding anonymous media, rather than implying a code crash."""
+    if _is_youtube_bot_check(lines):
+        return (
+            "YouTube has challenged this bot's server request with an anti-bot verification check. "
+            "This is a source-access restriction, not a video-quality or Telegram error. The bot cannot "
+            "force a download while YouTube withholds the stream, and changing resolution will not fix it. "
+            "Please retry later; if it continues, this hosting IP may be temporarily rate-limited."
+        )
+    return _clean_ytdlp_error(lines)
 
 
 def _clean_ytdlp_error(lines: list[str]) -> str:
@@ -822,7 +882,8 @@ def _download_media(
     # slides while ignoring photo slides that have no video format.
     if is_instagram:
         command_base += ["--impersonate", os.environ.get("INSTAGRAM_IMPERSONATE", "chrome"), "--ignore-errors"]
-    else:
+    elif _is_youtube_url(url):
+        # Optional YouTube session data is never sent to unrelated extractor hosts.
         command_base += _cookie_args(workdir)
     if not is_instagram:
         command_base.append("--no-playlist")
@@ -925,7 +986,7 @@ def _download_media(
 
     if not files:
         if return_code != 0 and not is_instagram:
-            raise RuntimeError(_clean_ytdlp_error(tail))
+            raise RuntimeError(_friendly_youtube_error(tail) if _is_youtube_url(url) else _clean_ytdlp_error(tail))
         tail_message = _clean_ytdlp_error(tail)
         if is_instagram and not subtitles:
             raise RuntimeError(
@@ -991,7 +1052,8 @@ def _get_video_meta(url: str) -> dict[str, Any] | None:
     with tempfile.TemporaryDirectory(prefix="dlmeta_", dir=WORK_DIR) as td:
         command = ["yt-dlp", "--ignore-config", "--dump-single-json", "--no-playlist", "--skip-download",
                    "--no-warnings", "--remote-components", "ejs:github"]
-        command += _cookie_args(td)
+        if _is_youtube_url(url):
+            command += _cookie_args(td)
         command.append(url)
         try:
             result = _run_capture(command, 90)
@@ -2069,6 +2131,18 @@ async def _run_pipeline(
             "Fetching subtitles…" if subtitles else "Preparing your MP3…" if mp3 else "Starting download…"
         )
         schedule_auto_delete(context, status, reset=True)
+    if _is_youtube_url(url):
+        remaining = _youtube_verification_cooldown_remaining()
+        if remaining > 0:
+            minutes = max(1, (remaining + 59) // 60)
+            await safe_edit(
+                status,
+                "Skipping this YouTube request because the previous request from this server was challenged "
+                f"for verification. To avoid repeated failed requests, YouTube downloads are paused for about {minutes} more minute(s). "
+                "Instagram jobs continue normally; this pause expires automatically.",
+            )
+            schedule_auto_delete(context, status, reset=True)
+            return False
     add_history(uid, url)
     # Remove the user's source-link/command text later; uploaded media messages are not scheduled.
     schedule_auto_delete(context, message)
@@ -2131,7 +2205,7 @@ async def _run_pipeline(
                         ),
                     )
                 except (RuntimeError, TimeoutError, OSError, subprocess.SubprocessError) as exc:
-                    last_error = str(exc)[:240] or type(exc).__name__
+                    last_error = str(exc)[:500] or type(exc).__name__
                     log.warning("Download attempt %s failed (%s)", index, type(exc).__name__)
                     stop_event.set()
                     reporter.cancel()
@@ -2140,6 +2214,12 @@ async def _run_pipeline(
                     except asyncio.CancelledError:
                         pass
                     shutil.rmtree(attempt_dir, ignore_errors=True)
+                    if _is_youtube_url(url) and _is_youtube_verification_error(last_error):
+                        # A resolution change cannot fix a source-side verification gate.
+                        # Stop format retries and pause queued YouTube requests temporarily;
+                        # other platforms can continue through the FIFO queue.
+                        _record_youtube_verification_challenge()
+                        break
                     continue
 
                 try:
@@ -2278,38 +2358,27 @@ async def download_job(
     mp3: bool = False,
     subtitles: bool = False,
     force_fmt: str | None = None,
+    playlist: bool = False,
 ) -> None:
-    user = update.effective_user
-    message = update.effective_message
-    if user is None or message is None:
-        return
-    uid = user.id
-    schedule_auto_delete(context, message)
-    # No await before this check/set: handlers execute this critical section on one event loop.
-    if uid in _active_users:
-        await reply_text_auto(context, message, "You already have a job running. Please wait for it to finish.")
-        return
-    wait = _rate_remaining(uid)
-    if wait:
-        await reply_text_auto(context, message, f"Please wait {wait} second(s) before starting another download.")
-        return
-    _active_users.add(uid)
-    try:
-        async with context.bot_data["download_semaphore"]:
-            await _run_pipeline(update, context, url, mp3=mp3, subtitles=subtitles, force_fmt=force_fmt)
-    finally:
-        _active_users.discard(uid)
+    """Queue one request; downloads run in a single FIFO background worker."""
+    await _enqueue_download_requests(
+        update, context, [url], mp3=mp3, subtitles=subtitles,
+        force_fmt=force_fmt, playlist=playlist,
+    )
+
 
 def _expand_playlist_links(url: str) -> list[str]:
     """Resolve a bounded YouTube playlist to individual URLs using yt-dlp flat metadata."""
     with tempfile.TemporaryDirectory(prefix="dlqueue_playlist_", dir=WORK_DIR) as td:
         command = ["yt-dlp", "--ignore-config", "--dump-single-json", "--flat-playlist",
                    "--playlist-end", str(MAX_PLAYLIST), "--no-warnings", "--remote-components", "ejs:github"]
-        command += _cookie_args(td)
+        if _is_youtube_url(url):
+            command += _cookie_args(td)
         command.append(url)
         result = _run_capture(command, 120)
         if result.returncode != 0:
-            detail = _clean_ytdlp_error((result.stdout + "\n" + result.stderr).splitlines())
+            lines = (result.stdout + "\n" + result.stderr).splitlines()
+            detail = _friendly_youtube_error(lines) if _is_youtube_url(url) else _clean_ytdlp_error(lines)
             raise RuntimeError(detail or "Could not read this playlist.")
         try:
             payload = json.loads(result.stdout or "{}")
@@ -2346,87 +2415,169 @@ def _expand_playlist_links(url: str) -> list[str]:
         return links
 
 
-async def download_batch_job(
+def _queue_item_key(url: str, *, mp3: bool, subtitles: bool, force_fmt: str | None, playlist: bool) -> str:
+    fields = [url, "mp3" if mp3 else "video", "subs" if subtitles else "no-subs", force_fmt or "auto", "playlist" if playlist else "single"]
+    return hashlib.sha256("\0".join(fields).encode("utf-8")).hexdigest()
+
+
+async def _enqueue_download_requests(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     urls: list[str],
+    *,
+    mp3: bool = False,
+    subtitles: bool = False,
+    force_fmt: str | None = None,
+    playlist: bool = False,
 ) -> None:
-    """Reserve this user's queue and serialize it with all other downloads."""
+    """Add links to the shared FIFO queue and return immediately while jobs run in background."""
+    message = update.effective_message
     user = update.effective_user
-    message = update.effective_message
-    if user is None or message is None:
+    if message is None or user is None:
         return
-    uid = user.id
-    if uid in _active_users:
-        await reply_text_auto(context, message, "You already have a queue running. Please wait for it to finish.")
+    schedule_auto_delete(context, message)
+    queue: asyncio.Queue | None = context.bot_data.get("download_queue")
+    lock: asyncio.Lock | None = context.bot_data.get("queue_enqueue_lock")
+    queued_keys: set[str] = context.bot_data.get("queued_job_keys", set())
+    if queue is None or lock is None:
+        await reply_text_auto(context, message, "The download queue is starting. Please resend this link shortly.")
         return
-    wait = _rate_remaining(uid)
-    if wait:
-        await reply_text_auto(context, message, f"Please wait {wait} second(s) before starting a new queue.")
-        return
-    _active_users.add(uid)
-    try:
-        async with context.bot_data["download_semaphore"]:
-            await _download_batch_locked(update, context, urls)
-    finally:
-        _active_users.discard(uid)
 
-
-async def _download_batch_locked(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    urls: list[str],
-) -> None:
-    message = update.effective_message
-    setup_status = await reply_text_auto(context, message, "Preparing your sequential download queue…")
-    expanded: list[str] = []
-    setup_failures = 0
-    pool = context.bot_data["pool"]
-    for position, raw_url in enumerate(urls, start=1):
-        if len(expanded) >= MAX_BATCH_LINKS:
-            break
+    accepted = duplicates = invalid = full = 0
+    candidates: list[tuple[str, dict[str, Any]]] = []
+    for raw_url in urls[:MAX_BATCH_LINKS]:
         try:
             url = validate_url(raw_url)
-            if _is_youtube_playlist_url(url):
-                await safe_edit(setup_status, f"Reading playlist link {position}/{len(urls)}…")
-                playlist_links = await asyncio.get_running_loop().run_in_executor(
-                    pool, lambda link=url: _expand_playlist_links(link)
-                )
-                for playlist_link in playlist_links:
-                    if playlist_link not in expanded:
-                        expanded.append(playlist_link)
-                    if len(expanded) >= MAX_BATCH_LINKS:
-                        break
-            else:
-                if url not in expanded:
-                    expanded.append(url)
-        except (ValueError, RuntimeError, OSError, subprocess.SubprocessError, TimeoutError) as exc:
-            setup_failures += 1
-            log.warning("Could not queue URL %s (%s)", position, type(exc).__name__)
-    if not expanded:
-        await safe_edit(setup_status, "No downloadable links could be queued. Check that the links are public and valid.")
-        schedule_auto_delete(context, setup_status, reset=True)
+        except ValueError:
+            invalid += 1
+            continue
+        key = _queue_item_key(url, mp3=mp3, subtitles=subtitles, force_fmt=force_fmt, playlist=playlist)
+        candidates.append((key, {
+            "key": key, "url": url, "update": update, "context": context,
+            "user_id": user.id, "chat_id": message.chat_id,
+            "mp3": mp3, "subtitles": subtitles, "force_fmt": force_fmt,
+            "playlist": playlist,
+        }))
+
+    # The lock plus queue.put_nowait keeps enqueue operations atomic and in handler order.
+    async with lock:
+        for key, item in candidates:
+            if key in queued_keys:
+                duplicates += 1
+                continue
+            if queue.full():
+                full += 1
+                continue
+            queued_keys.add(key)
+            queue.put_nowait(item)
+            accepted += 1
+
+    context.bot_data["queued_job_keys"] = queued_keys
+    pending = queue.qsize() + (1 if context.bot_data.get("queue_active") else 0)
+    notes: list[str] = []
+    if accepted:
+        notes.append(f"Queued {accepted} link(s). Downloads will start automatically, one at a time.")
+        notes.append(f"Queue status: about {pending} job(s) pending or running.")
+    if duplicates:
+        notes.append(f"Skipped {duplicates} duplicate link(s) already waiting or downloading.")
+    if invalid:
+        notes.append(f"Skipped {invalid} invalid URL(s).")
+    if full:
+        notes.append(f"Queue is full; {full} link(s) were not added. Try again when some jobs finish.")
+    if not notes:
+        notes.append("No new links were added to the queue.")
+    await reply_text_auto(context, message, "\n".join(notes))
+
+
+async def download_batch_job(update: Update, context: ContextTypes.DEFAULT_TYPE, urls: list[str]) -> None:
+    """Queue several links from one message while retaining their message order."""
+    await _enqueue_download_requests(update, context, urls[:MAX_BATCH_LINKS])
+
+
+async def _execute_queued_item(app: Application, item: dict[str, Any]) -> None:
+    update: Update = item["update"]
+    context: ContextTypes.DEFAULT_TYPE = item["context"]
+    message = update.effective_message
+    chat = update.effective_chat
+    chat_id = item.get("chat_id") or (chat.id if chat else None)
+    if chat_id is None or message is None:
         return
-    await safe_edit(setup_status, f"Queue ready: {len(expanded)} link(s). Downloads will run one at a time.")
-    schedule_auto_delete(context, setup_status, reset=True)
-    successes = 0
-    for index, link in enumerate(expanded, start=1):
-        # Do not reply to the original user message here: its auto-delete timer may
-        # have elapsed while earlier links were downloading.
-        item_status = await context.bot.send_message(
-            chat_id=message.chat_id,
-            text=f"Queue item {index}/{len(expanded)}: starting…",
-        )
-        schedule_auto_delete(context, item_status)
-        ok = await _run_pipeline(update, context, link, status=item_status)
-        successes += int(ok)
-        if index < len(expanded):
-            await asyncio.sleep(1.05)
-    summary = f"Queue finished: {successes}/{len(expanded)} link(s) downloaded successfully."
-    if setup_failures:
-        summary += f" {setup_failures} playlist/URL item(s) could not be added."
-    summary_message = await context.bot.send_message(chat_id=message.chat_id, text=summary)
-    schedule_auto_delete(context, summary_message)
+
+    status = await context.bot.send_message(
+        chat_id=chat_id, text="Starting queued download…",
+        connect_timeout=20, read_timeout=30, write_timeout=30,
+    )
+    schedule_auto_delete(context, status, reset=True)
+    url = item["url"]
+    should_expand_playlist = bool(item.get("playlist")) or _is_youtube_playlist_url(url)
+
+    if should_expand_playlist:
+        await safe_edit(status, "Reading playlist entries…")
+        try:
+            links = await asyncio.get_running_loop().run_in_executor(
+                context.bot_data["pool"], lambda target=url: _expand_playlist_links(target)
+            )
+        except (ValueError, RuntimeError, OSError, subprocess.SubprocessError, TimeoutError) as exc:
+            log.warning("Queued playlist expansion failed (%s)", type(exc).__name__)
+            detail = _friendly_youtube_error([str(exc)]) if _is_youtube_url(url) else str(exc)
+            await safe_edit(status, f"Playlist failed: {detail[:350] or type(exc).__name__}")
+            schedule_auto_delete(context, status, reset=True)
+            return
+        if not links:
+            await safe_edit(status, "No public playlist items were available.")
+            schedule_auto_delete(context, status, reset=True)
+            return
+        successes = 0
+        for index, link in enumerate(links, start=1):
+            await safe_edit(status, f"Playlist item {index}/{len(links)}: starting…")
+            ok = await _run_pipeline(
+                update, context, link,
+                mp3=bool(item.get("mp3")), subtitles=bool(item.get("subtitles")),
+                force_fmt=item.get("force_fmt"), status=status,
+            )
+            successes += int(ok)
+            if index < len(links):
+                await asyncio.sleep(1.05)
+        await safe_edit(status, f"Playlist finished: {successes}/{len(links)} item(s) downloaded successfully.")
+        schedule_auto_delete(context, status, reset=True)
+        return
+
+    await _run_pipeline(
+        update, context, url, mp3=bool(item.get("mp3")), subtitles=bool(item.get("subtitles")),
+        force_fmt=item.get("force_fmt"), status=status,
+    )
+
+
+async def _download_queue_worker(app: Application) -> None:
+    """Single consumer: messages can arrive continuously while downloads stay sequential."""
+    queue: asyncio.Queue = app.bot_data["download_queue"]
+    while True:
+        item = await queue.get()
+        key = item.get("key", "")
+        uid = item.get("user_id")
+        app.bot_data["queue_active"] = True
+        try:
+            async with app.bot_data["download_semaphore"]:
+                if isinstance(uid, int):
+                    _active_users.add(uid)
+                await _execute_queued_item(app, item)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.exception("Queued download job failed (%s)", type(exc).__name__)
+            try:
+                await app.bot.send_message(
+                    chat_id=item.get("chat_id"),
+                    text=f"Queued job failed unexpectedly ({type(exc).__name__}). The next job will continue.",
+                )
+            except Exception:
+                log.warning("Could not send queued-job failure notice")
+        finally:
+            if isinstance(uid, int):
+                _active_users.discard(uid)
+            app.bot_data.get("queued_job_keys", set()).discard(key)
+            queue.task_done()
+            app.bot_data["queue_active"] = not queue.empty()
 
 
 # --------------------------- Commands ---------------------------
@@ -2463,33 +2614,33 @@ async def handle_sub(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
-    if message:
-        schedule_auto_delete(context, message)
-    text = message.text or "" if message else ""
+    text = (message.text or "") if message else ""
     if text.startswith("/"):
         return
-    urls = extract_urls(text)
+    urls = extract_urls(text, limit=MAX_BATCH_LINKS + 1)
     if not urls:
-        await reply_text_auto(context, message, "I couldn't find a valid URL. Please send a full HTTP/HTTPS link.")
+        if message:
+            schedule_auto_delete(context, message)
+            await reply_text_auto(context, message, "I couldn't find a valid URL. Please send a full HTTP/HTTPS link.")
         return
-    if len(urls) > MAX_BATCH_LINKS:
+    was_truncated = len(urls) > MAX_BATCH_LINKS
+    if was_truncated:
         urls = urls[:MAX_BATCH_LINKS]
-        await reply_text_auto(context, message, f"The queue is limited to {MAX_BATCH_LINKS} links per message; the first {MAX_BATCH_LINKS} will be processed.")
-    if update.effective_user and update.effective_user.id in _active_users:
-        await reply_text_auto(context, message, "You already have a download running. Your new links were not queued; send them again after the current queue finishes.")
-        return
-    if len(urls) > 1:
-        await download_batch_job(update, context, urls)
-        return
-    url = urls[0]
-    if _is_youtube_playlist_url(url):
-        # A single playlist URL starts the bounded, sequential playlist flow automatically.
-        await handle_playlist(update, context)
-    elif _is_youtube_url(url):
-        await youtube_menu(update, context, url)
-    else:
-        await download_job(update, context, url)
+    # Enqueue before any warning await so later Telegram messages cannot jump ahead.
+    await download_batch_job(update, context, urls)
+    if was_truncated:
+        await reply_text_auto(context, message, f"This message is limited to {MAX_BATCH_LINKS} links; the first {MAX_BATCH_LINKS} were queued.")
 
+
+async def handle_choose_quality(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if not message:
+        return
+    url = first_url(message.text)
+    if not url or not _is_youtube_url(url):
+        await reply_text_auto(context, message, "Usage: /choose https://www.youtube.com/watch?v=VIDEO_ID")
+        return
+    await youtube_menu(update, context, url)
 
 async def youtube_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str) -> None:
     try:
@@ -2762,51 +2913,11 @@ async def handle_again(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def handle_playlist(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
-    url = first_url(message.text)
+    url = first_url(message.text if message else "")
     if not url:
-        await reply_text_auto(context, message, "Usage: /playlist https://example.com/playlist")
+        await reply_text_auto(context, message, "Usage: /playlist https://www.youtube.com/playlist?list=...")
         return
-    user = update.effective_user
-    if user.id in _active_users:
-        await reply_text_auto(context, message, "You already have a job running. Please wait for it to finish.")
-        return
-    try:
-        url = validate_url(url)
-    except ValueError as exc:
-        await reply_text_auto(context, message, str(exc))
-        return
-    schedule_auto_delete(context, message)
-    wait = _rate_remaining(user.id)
-    if wait:
-        await reply_text_auto(context, message, f"Please wait {wait} second(s) before starting another download.")
-        return
-    _active_users.add(user.id)
-    status = await reply_text_auto(context, message, "Reading the playlist…")
-    try:
-        async with context.bot_data["download_semaphore"]:
-            try:
-                links = await asyncio.get_running_loop().run_in_executor(
-                    context.bot_data["pool"], lambda: _expand_playlist_links(url)
-                )
-            except (ValueError, RuntimeError, OSError, subprocess.SubprocessError, TimeoutError) as exc:
-                log.warning("Playlist extraction failed (%s)", type(exc).__name__)
-                links = []
-            if not links:
-                await safe_edit(status, "I couldn't read this playlist. It may be private, unsupported, or empty.")
-                return
-            await safe_edit(status, f"Found {len(links)} item(s). Starting sequential downloads…")
-            successes = 0
-            for index, link in enumerate(links, start=1):
-                await safe_edit(status, f"Playlist item {index}/{len(links)}: downloading…")
-                # Process sequentially as part of one user job; do not reapply the user cooldown per item.
-                ok = await _run_pipeline(update, context, link, status=status)
-                successes += int(ok)
-                if index < len(links):
-                    await asyncio.sleep(1.05)
-            await safe_edit(status, f"Playlist finished: {successes}/{len(links)} item(s) sent successfully.")
-    finally:
-        schedule_auto_delete(context, status, reset=True)
-        _active_users.discard(user.id)
+    await download_job(update, context, url, playlist=True)
 
 
 async def handle_disk(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2954,6 +3065,7 @@ async def post_init(app: Application) -> None:
     await app.bot.set_my_commands([
         BotCommand("start", "Show help and commands"),
         BotCommand("q", "Choose preferred video quality"),
+        BotCommand("choose", "Open a per-video quality menu"),
         BotCommand("auto", "Enable automatic quality selection"),
         BotCommand("audio", "Download audio as MP3"),
         BotCommand("sub", "Download available subtitles"),
@@ -2970,6 +3082,16 @@ async def post_init(app: Application) -> None:
     app.bot_data["heartbeat_task"] = asyncio.create_task(
         _telegram_heartbeat(app), name="telegram-heartbeat"
     )
+    # A single FIFO consumer guarantees all separately sent links are accepted while
+    # another download runs and then processed one by one in arrival order.
+    app.bot_data["download_queue"] = asyncio.Queue(maxsize=MAX_PENDING_QUEUE)
+    app.bot_data["queue_enqueue_lock"] = asyncio.Lock()
+    app.bot_data["queued_job_keys"] = set()
+    app.bot_data["queue_active"] = False
+    app.bot_data["download_queue_task"] = asyncio.create_task(
+        _download_queue_worker(app), name="download-queue-worker"
+    )
+    log.info("Download FIFO queue started (waiting capacity=%s; sequential update intake)", MAX_PENDING_QUEUE)
     if DATABASE_URL:
         app.bot_data["delete_db_retry_task"] = asyncio.create_task(
             _retry_auto_delete_database(app), name="auto-delete-db-retry"
@@ -2999,7 +3121,10 @@ async def _retry_auto_delete_database(app: Application) -> None:
 async def post_stop(app: Application) -> None:
     # Cancel ordinary asyncio timer tasks explicitly. Pending due times remain in
     # persistent state/database and are restored the next time the bot starts.
-    for name in ("heartbeat_task", "delete_db_retry_task"):
+    pending_queue = app.bot_data.get("download_queue")
+    if pending_queue is not None and not pending_queue.empty():
+        log.warning("Shutdown with %s queued job(s); the in-memory queue is not persistent", pending_queue.qsize())
+    for name in ("heartbeat_task", "delete_db_retry_task", "download_queue_task"):
         task = app.bot_data.pop(name, None)
         if task is not None and not task.done():
             task.cancel()
@@ -3016,7 +3141,10 @@ async def post_stop(app: Application) -> None:
 
 
 def build_application() -> Application:
-    app = (Application.builder().token(TOKEN).concurrent_updates(4)
+    # Keep update handlers sequential so rapidly sent messages enter the FIFO queue
+    # in Telegram update order. Downloads themselves run in the separate queue worker,
+    # so a long download does not block new links from being accepted.
+    app = (Application.builder().token(TOKEN)
            .post_init(post_init).post_stop(post_stop).build())
     app.bot_data["pool"] = ThreadPoolExecutor(max_workers=2, thread_name_prefix="media-worker")
     app.bot_data["download_semaphore"] = asyncio.Semaphore(1)
@@ -3027,6 +3155,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("stats", handle_stats))
     app.add_handler(CommandHandler("auto", handle_auto))
     app.add_handler(CommandHandler("q", handle_quality))
+    app.add_handler(CommandHandler("choose", handle_choose_quality))
     app.add_handler(CommandHandler("history", handle_history))
     app.add_handler(CommandHandler("again", handle_again))
     app.add_handler(CommandHandler("disk", handle_disk))
@@ -3057,6 +3186,8 @@ def check_runtime() -> None:
     log.info("yt-dlp version: %s", result.stdout.strip() or "unknown")
     deno = shutil.which("deno")
     log.info("Deno runtime: %s", deno or "not detected (some YouTube downloads may fail)")
+    log.info("Pending queue capacity: %s", MAX_PENDING_QUEUE)
+    log.info("YouTube verification failures stop format retries early")
 
 
 

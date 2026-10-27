@@ -36,7 +36,7 @@ DEPLOYMENT
 4. Stop every duplicate service/process using this token first. Then set TELEGRAM_MODE=webhook. On Render, RENDER_EXTERNAL_URL is used automatically; if your provider does not set that variable, set WEBHOOK_URL to the HTTPS base URL such as `https://your-service.onrender.com` (do not include `/telegram`).
 5. TELEGRAM_WEBHOOK_SECRET is optional. If not provided, the bot derives a valid secret header token from BOT_TOKEN. For better secret separation, set an independent random secret containing only letters, digits, underscores or hyphens (maximum 256 characters).
 6. For deletion recovery across Render restarts/redeploys, create a Render Postgres database and add its connection string as DATABASE_URL. Without it the bot logs a warning and uses local state only. Render Free local files are ephemeral; the Free Postgres tier currently expires after 30 days, so it is not permanent storage.
-7. Deploy and check logs for `Bot version: v12.3-cookiefree-instagram-fallback`, `Telegram transport mode: webhook`, `Telegram webhook registered`, and `Auto-delete scheduled ...`. Test a short public YouTube video first, then an Instagram Reel that opens without signing in. Instagram may still withhold media from data-center/server IPs; this version does not use Instagram cookies and cannot override such restrictions.
+7. Deploy and check logs for `Bot version: v12.4-youtube-error-queue-fix`, `Telegram transport mode: webhook`, `Telegram webhook registered`, and `Auto-delete scheduled ...`. Test a short public YouTube video first, then an Instagram Reel that opens without signing in. Instagram may still withhold media from data-center/server IPs; this version does not use Instagram cookies and cannot override such restrictions.
 8. Uploaded videos/audio/photos/documents are not auto-deleted. Only temporary bot text/menu/status messages and the source-link/command messages are scheduled; Telegram may reject deletion if permissions or message-age restrictions prevent it.
 
 ENVIRONMENT VARIABLES
@@ -84,3 +84,14 @@ V12.3 OFFLINE QA
 
 INSTAGRAM COOKIE-FREE LIMITATION
 - This version intentionally never passes Instagram cookies to yt-dlp or curl-cffi. It uses curl-cffi browser impersonation and, after an extractor failure, checks only public HTML metadata for a direct CDN video URL. If Instagram does not expose one to the hosting server (login wall, rate limit, or IP block), a no-cookie downloader cannot guarantee retrieval. Do not add fingerprint rotation or private API scraping to try to defeat those restrictions.
+
+
+Version v12.4 notes
+-------------------
+* All plain URL messages enter one FIFO queue; later messages are not rejected while a download is active.
+* One worker processes queued links sequentially, default capacity 100 waiting jobs.
+* YouTube's explicit anonymous bot/verification refusal is shown clearly and stops repeated quality attempts. Further YouTube requests pause for 10 minutes by default after the challenge; Instagram jobs continue. The bot does not bypass source identity checks.
+* Use /q or /auto for default quality settings; use /choose URL for a manual YouTube resolution menu.
+* Pending queued jobs are in memory and are lost if the hosting service restarts.
+
+Environment variable: `YOUTUBE_VERIFICATION_COOLDOWN_SECONDS` (default `600`, maximum `3600`) controls the pause after YouTube explicitly challenges anonymous requests. Set it to `0` to disable the pause.
